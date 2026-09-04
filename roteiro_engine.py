@@ -219,6 +219,162 @@ Retorne APENAS JSON com estas 4 chaves:
     return _extrair_json(resposta.text)
 
 
+# ============================================================
+# ESTÁGIOS 1-2 (MODO WEBDOC EM CAPÍTULOS) — formato investigativo tipo
+# "Elementar": introdução com dado forte, N capítulos nomeados (cada um cobrindo
+# um ÂNGULO diferente do tema, não um passo de argumentação), desfecho.
+# ============================================================
+
+def gerar_estrutura_capitulos(tema, contexto_nicho, idioma_conteudo, gemini_generate_fn, num_capitulos=3):
+    """
+    Estrutura alternativa à argumentativa (tese/objeção) e à devocional (abertura/
+    reflexão) — aqui a lógica é jornalística/investigativa: cada capítulo cobre uma
+    FACETA distinta do tema (origem do problema, como funciona hoje, quem é afetado,
+    comparação com outro caso etc.), não um degrau de um argumento.
+
+    O título de cada capítulo (curto, tipo rótulo de seção de documentário — "A
+    Fábrica de Prédios", "O Esquema do Repasse") é o que vira o CARD PRETO de
+    transição entre capítulos no vídeo final, e também dá nome à pasta/critério de
+    música tema daquele trecho (ver generate_video.py → gerar_card_capitulo /
+    _mixar_musica_por_capitulo).
+    """
+    prompt = f"""Você é roteirista de documentário investigativo de dados (estilo canais
+como "Elementar" no YouTube — vídeos tipo "Por que X está assim?", "A fraude de Y",
+"O esquema de Z", sempre com dado oficial concreto por trás). NÃO escreva prosa ainda —
+apenas o esqueleto, em {idioma_conteudo}.
+
+NICHO: {contexto_nicho}
+TEMA: "{tema}"
+
+Construa {num_capitulos} capítulos, cada um cobrindo uma FACETA DIFERENTE do tema —
+escolha os {num_capitulos} ângulos mais fortes especificamente pra ESTE tema (não uma
+lista genérica que serviria pra qualquer tema do nicho).
+
+Regras:
+- O título de cada capítulo tem 3 a 6 palavras, como um RÓTULO de seção de documentário
+  — não é uma frase completa (ex: "A Fábrica de Prédios", não "Por que os prédios são
+  construídos assim")
+- A introdução deve abrir com um DADO ou FATO concreto e específico sobre o tema, não
+  uma pergunta genérica
+- O desfecho deve responder à pergunta implícita do vídeo, não só resumir os capítulos
+
+Retorne APENAS JSON:
+{{
+  "introducao": "o que a introdução deve cobrir — o dado forte de abertura + o tema",
+  "capitulos": [
+    {{"titulo": "Título Curto do Capítulo 1", "cobre": "que faceta/ângulo este capítulo aborda, em detalhe suficiente pra escrever a prosa depois"}}
+  ],
+  "desfecho": "o que o desfecho deve responder/concluir"
+}}
+(o array "capitulos" deve ter exatamente {num_capitulos} itens)"""
+
+    resposta = gemini_generate_fn(prompt)
+    return _extrair_json(resposta.text)
+
+
+def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, instrucao_extra,
+                           documento_estilo, palavras_alvo, gemini_generate_fn):
+    """
+    Escreve a prosa de introdução/capítulos/desfecho reaproveitando gerar_prosa (mesmo
+    contrato: dict ordenado {{chave: descrição}} -> um bloco de texto por chave), e
+    depois anota cada bloco de capítulo com 'titulo_capitulo' + 'inicio_capitulo': True.
+
+    Esses dois metadados extras (que sobrevivem até blocos_com_tempo, porque
+    mapear_tempos_para_blocos faz **bloco ao montar o resultado) são o que
+    generate_video.py usa pra saber ONDE no vídeo inserir o card preto de transição e
+    trocar a música tema — sem precisar mexer em nada do pipeline de TTS/áudio: o
+    timestamp certo já vem de graça do mapeamento por contagem de palavras que já existe.
+
+    Truque de sincronismo: o título do capítulo entra FALADO no início do próprio bloco
+    ("A Fábrica de Prédios. " + resto do texto) — assim o card visual, que aparece
+    exatamente no timestamp de início do bloco, casa com o que o narrador está dizendo
+    naquele instante, em vez de aparecer "solto" sobre uma frase qualquer do meio do
+    capítulo.
+    """
+    estrutura_prosa = {'introducao': estrutura_capitulos['introducao']}
+    for i, cap in enumerate(estrutura_capitulos['capitulos']):
+        estrutura_prosa[f'capitulo_{i + 1}'] = cap['cobre']
+    estrutura_prosa['desfecho'] = estrutura_capitulos['desfecho']
+
+    blocos = gerar_prosa(estrutura_prosa, contexto_nicho, idioma_conteudo, instrucao_extra,
+                          documento_estilo, palavras_alvo, gemini_generate_fn)
+
+    titulos_capitulos = {f'capitulo_{i + 1}': cap['titulo']
+                          for i, cap in enumerate(estrutura_capitulos['capitulos'])}
+    for b in blocos:
+        titulo_cap = titulos_capitulos.get(b['bloco'])
+        b['titulo_capitulo'] = titulo_cap
+        b['inicio_capitulo'] = titulo_cap is not None
+        if titulo_cap:
+            b['texto'] = f"{titulo_cap}. {b['texto']}"
+
+    return blocos
+
+
+def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
+                                    documento_estilo, tipo_video, gemini_generate_fn,
+                                    num_capitulos=3):
+    """
+    Modo 'capitulos_webdoc' — formato investigativo em capítulos nomeados, cada um com
+    card de transição e música própria. Mesmo contrato de saída de gerar_pacote_roteiro
+    (roteiro_texto, roteiro_blocos, titulo, descricao), mais 'capitulos_meta' — lista
+    pronta de {{'titulo', 'bloco'}} pra quem não quiser vasculhar roteiro_blocos.
+    """
+    palavras_alvo = 180 if tipo_video == 'short' else 900  # webdoc investigativo tende a ser mais longo (12-20min)
+
+    try:
+        print("  🧱 Estágio 1/4 — estrutura em capítulos...")
+        estrutura = gerar_estrutura_capitulos(tema, contexto_nicho, idioma_conteudo,
+                                               gemini_generate_fn, num_capitulos)
+
+        print("  ✍️ Estágio 2/4 — escrita...")
+        blocos = gerar_prosa_capitulos(estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
+                                        documento_estilo, palavras_alvo, gemini_generate_fn)
+
+        print("  🔍 Estágio 3/4 — crítica adversarial...")
+        blocos = criticar_e_reescrever(blocos, idioma_conteudo, gemini_generate_fn)
+        # criticar_e_reescrever reescreve 'texto' inteiro — se a reescrita tiver comido o
+        # título falado no começo do bloco, recoloca (comparação simples de prefixo)
+        for b in blocos:
+            titulo_cap = b.get('titulo_capitulo')
+            if titulo_cap and not b['texto'].lstrip().startswith(titulo_cap):
+                b['texto'] = f"{titulo_cap}. {b['texto']}"
+
+        print("  🏷️ Estágio 4/4 — título e descrição...")
+        titulo = gerar_titulo_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn)
+        descricao = gerar_descricao_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn)
+
+        roteiro_texto = " ".join(b['texto'] for b in blocos)
+        capitulos_meta = [{'titulo': b['titulo_capitulo'], 'bloco': b['bloco']}
+                           for b in blocos if b.get('inicio_capitulo')]
+
+        return {
+            'roteiro_texto': roteiro_texto,
+            'roteiro_blocos': blocos,
+            'titulo': titulo,
+            'descricao': descricao,
+            'tese': None,
+            'modo': 'capitulos_webdoc',
+            'capitulos_meta': capitulos_meta,
+        }
+    except Exception as e:
+        print(f"  ⚠️ Cadeia de capítulos falhou ({e}) — usando geração simples de emergência")
+        prompt_simples = f"""Crie um roteiro de narração investigativo para um vídeo de {contexto_nicho}
+sobre "{tema}", em {idioma_conteudo}, ~{palavras_alvo} palavras, tom direto e factual.
+Escreva APENAS o roteiro corrido."""
+        resposta = gemini_generate_fn(prompt_simples)
+        roteiro_texto = re.sub(r'\*+', '', resposta.text).replace('#', '').strip()
+        return {
+            'roteiro_texto': roteiro_texto,
+            'roteiro_blocos': [{'bloco': 'roteiro_completo', 'texto': roteiro_texto}],
+            'titulo': tema,
+            'descricao': {'abertura_seo': tema, 'corpo': roteiro_texto[:200]},
+            'tese': None,
+            'modo': 'fallback_simples',
+            'capitulos_meta': [],
+        }
+
+
 def gerar_titulo_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn):
     prompt = f"""Gere 10 variantes de título de vídeo para YouTube, em {idioma_conteudo}.
 Cada variante prioriza EXPLICITAMENTE um destes critérios (rotule qual):
@@ -400,19 +556,26 @@ Retorne APENAS JSON: {{"abertura_seo": "...", "corpo": "..."}}"""
 
 def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                           documento_estilo, tipo_video, gemini_generate_fn,
-                          modo_roteiro='cadeia_completa'):
+                          modo_roteiro='cadeia_completa', num_capitulos=3):
     """
-    Roda a cadeia completa (modo_roteiro='cadeia_completa', padrão) ou o modo simples
-    sem tese/objeção (modo_roteiro='simples' — ler config.json do canal). Os dois modos
-    devolvem exatamente o mesmo formato de saída (roteiro_texto, roteiro_blocos, titulo,
-    descricao), então nada em generate_video.py precisa saber qual modo rodou — inclusive
-    a Fase 2 de produção visual (B-roll por bloco, destaque, SFX) funciona igual nos dois,
-    porque só depende de roteiro_blocos existir, não de COMO ele foi gerado.
-    Se qualquer estágio falhar, cai pra um roteiro simples de emergência (uma chamada só)
-    em vez de quebrar o workflow inteiro — mesmo espírito de fallback que já existe em
-    criar_audio().
+    Roda a cadeia completa (modo_roteiro='cadeia_completa', padrão), o modo simples
+    sem tese/objeção (modo_roteiro='simples'), ou o modo webdoc em capítulos nomeados
+    (modo_roteiro='capitulos_webdoc' — ver gerar_pacote_roteiro_capitulos). Os três
+    modos devolvem exatamente o mesmo formato de saída (roteiro_texto, roteiro_blocos,
+    titulo, descricao), então nada em generate_video.py precisa saber qual modo rodou —
+    inclusive a Fase 2 de produção visual (B-roll por bloco, destaque, SFX) funciona
+    igual nos três, porque só depende de roteiro_blocos existir, não de COMO ele foi
+    gerado. Se qualquer estágio falhar, cai pra um roteiro simples de emergência (uma
+    chamada só) em vez de quebrar o workflow inteiro — mesmo espírito de fallback que
+    já existe em criar_audio().
     """
     palavras_alvo = 180 if tipo_video == 'short' else 650
+
+    if modo_roteiro == 'capitulos_webdoc':
+        return gerar_pacote_roteiro_capitulos(
+            tema, contexto_nicho, idioma_conteudo, instrucao_extra, documento_estilo,
+            tipo_video, gemini_generate_fn, num_capitulos=num_capitulos
+        )
 
     try:
         if modo_roteiro == 'simples':

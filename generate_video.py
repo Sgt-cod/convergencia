@@ -1096,6 +1096,71 @@ def _mixar_musica_fundo(audio_narracao, duracao_total, volume=0.06, musicas_dir=
     return CompositeAudioClip([audio_narracao, musica])
 
 
+def _mixar_musica_por_capitulo(audio_narracao, duracao_total, marcos_capitulos, volume=0.06,
+                                musicas_dir='assets/musicas', crossfade=1.5):
+    """
+    Versão em capítulos do _mixar_musica_fundo: em vez de UMA faixa tocando o vídeo
+    inteiro, sorteia uma faixa DIFERENTE pra cada trecho entre marcos_capitulos (cada
+    capítulo tem sua própria "música tema", com crossfade suave na troca) — é o que dá
+    o "ritmo que muda por capítulo" descrito no formato Elementar.
+
+    marcos_capitulos: lista de instantes (float, segundos, já no tempo final do vídeo —
+    ou seja, já somado offset_narracao) em que um novo capítulo começa. O primeiro
+    trecho (introdução, antes do primeiro marco) também sorteia sua própria faixa.
+
+    Se assets/musicas/ tiver menos faixas que capítulos, repete faixas (sem travar o
+    pipeline) — mas avisa, porque idealmente cada capítulo tem uma faixa distinta.
+    Se marcos_capitulos vier vazio, cai pro comportamento de _mixar_musica_fundo (uma
+    faixa só) — modo webdoc sem capítulos detectados não quebra.
+    """
+    import glob
+    import math
+    from moviepy.editor import AudioFileClip, CompositeAudioClip, concatenate_audioclips
+
+    if not marcos_capitulos:
+        return _mixar_musica_fundo(audio_narracao, duracao_total, volume, musicas_dir)
+
+    musicas = (glob.glob(f'{musicas_dir}/*.mp3') + glob.glob(f'{musicas_dir}/*.wav') +
+               glob.glob(f'{musicas_dir}/*.ogg'))
+    if not musicas:
+        print("  ⚠️ Nenhuma música encontrada em assets/musicas/ — sem fundo")
+        return audio_narracao
+
+    limites = [0.0] + sorted(marcos_capitulos) + [duracao_total]
+    n_trechos = len(limites) - 1
+
+    pool = musicas.copy()
+    random.shuffle(pool)
+    if len(pool) < n_trechos:
+        print(f"  ⚠️ Só {len(pool)} música(s) em {musicas_dir}/ pra {n_trechos} trecho(s) — "
+              f"algumas vão repetir (ideal: 1 faixa distinta por capítulo)")
+        while len(pool) < n_trechos:
+            pool += musicas
+    faixas_por_trecho = pool[:n_trechos]
+
+    trechos_audio = []
+    for i in range(n_trechos):
+        inicio_trecho, fim_trecho = limites[i], limites[i + 1]
+        duracao_trecho = max(0.1, fim_trecho - inicio_trecho)
+        # folga de 'crossfade' extra no fim de cada trecho (exceto o último) pra sobrar
+        # material real pra sobrepor na transição, em vez de repetir silêncio
+        duracao_com_folga = duracao_trecho + (crossfade if i < n_trechos - 1 else 0)
+
+        musica = AudioFileClip(faixas_por_trecho[i])
+        if musica.duration < duracao_com_folga:
+            repeticoes = math.ceil(duracao_com_folga / musica.duration)
+            musica = concatenate_audioclips([musica] * repeticoes)
+        musica = musica.subclip(0, duracao_com_folga).volumex(volume)
+        print(f"  🎼 Capítulo {i + 1}: {os.path.basename(faixas_por_trecho[i])} "
+              f"(t={inicio_trecho:.1f}s–{fim_trecho:.1f}s)")
+
+        if i > 0:
+            musica = musica.crossfadein(crossfade)
+        trechos_audio.append(musica.set_start(inicio_trecho))
+
+    return CompositeAudioClip([audio_narracao] + trechos_audio)
+
+
 def aplicar_sfx(audio_base, eventos_sfx, offset=0.0, sfx_dir='assets/sfx'):
     """
     Fase 2 — camada de SFX orientada a evento, mesmo espírito de fallback gracioso do
@@ -1226,8 +1291,17 @@ def criar_video_curto(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
 
 def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_narracao,
-                       clips_legenda=None, clips_destaque=None, eventos_sfx=None):
-    """Horizontal (long), com intro fixa de assets/intro/ antes do bloco lead-in/narração/tail."""
+                       clips_legenda=None, clips_destaque=None, eventos_sfx=None,
+                       blocos_com_tempo=None):
+    """Horizontal (long), com intro fixa de assets/intro/ antes do bloco lead-in/narração/tail.
+
+    blocos_com_tempo: opcional — só usado pro modo webdoc em capítulos (roteiro_engine.py
+    modo_roteiro='capitulos_webdoc'). Se algum bloco tiver 'inicio_capitulo': True, insere
+    um card preto com o título do capítulo (gerar_card_capitulo) no timestamp de início
+    daquele bloco, e troca a música de fundo por capítulo (_mixar_musica_por_capitulo) em
+    vez de uma faixa única pro vídeo inteiro. Sem isso (None, ou nenhum bloco marcado),
+    o vídeo sai exatamente como antes — feature 100% opt-in, não muda o modo padrão.
+    """
     print("📹 Criando vídeo longo (Pexels + intro)...")
     clips_legenda = clips_legenda or []
     clips_destaque = clips_destaque or []
@@ -1289,7 +1363,22 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     offset_narracao = intro_duracao + SEGUNDOS_LEAD_IN
 
-    todos_os_clips = ([intro_clip] if intro_clip else []) + clips_video + clips_legenda + clips_destaque
+    # Cards de capítulo (modo webdoc) — inseridos DEPOIS de clips_video na lista pra
+    # renderizar POR CIMA do B-roll (ocultando ele por trás do card durante a transição),
+    # exatamente no timestamp em que o narrador começa a falar aquele título.
+    cards_capitulo = []
+    marcos_capitulos_final = []
+    if blocos_com_tempo:
+        for b in blocos_com_tempo:
+            if b.get('inicio_capitulo') and b.get('titulo_capitulo'):
+                inicio_final = b['inicio'] + offset_narracao
+                marcos_capitulos_final.append(inicio_final)
+                card = gerar_card_capitulo(b['titulo_capitulo'], 1920, 1080).set_start(inicio_final)
+                cards_capitulo.append(card)
+        if cards_capitulo:
+            print(f"  📑 {len(cards_capitulo)} card(s) de capítulo inserido(s)")
+
+    todos_os_clips = ([intro_clip] if intro_clip else []) + clips_video + cards_capitulo + clips_legenda + clips_destaque
     if not todos_os_clips:
         return None
 
@@ -1298,7 +1387,7 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     audio_narr = AudioFileClip(audio_path).set_start(offset_narracao)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=offset_narracao)
-    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=0.06)
+    audio_final = _mixar_musica_por_capitulo(audio_com_sfx, duracao_total, marcos_capitulos_final, volume=0.06)
     audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
 
     video_final = video_base.set_audio(audio_final)
@@ -1330,6 +1419,62 @@ def _carregar_fonte_pil(tamanho):
 
     print("  ⚠️ Nenhuma fonte TTF encontrada — usando fonte padrão do PIL (qualidade menor)")
     return ImageFont.load_default()
+
+
+def _carregar_fonte_pil_destaque(tamanho):
+    """Mesmo fallback do _carregar_fonte_pil, mas priorizando FONTE_DESTAQUE — usado
+    pelo card de capítulo, que quer a MESMA fonte do texto de destaque (identidade
+    visual consistente entre os dois elementos de texto mais chamativos do vídeo)."""
+    if FONTE_DESTAQUE and os.path.exists(FONTE_DESTAQUE):
+        return ImageFont.truetype(FONTE_DESTAQUE, tamanho)
+    for caminho in _FONTE_TTF_CANDIDATOS:
+        if os.path.exists(caminho):
+            return ImageFont.truetype(caminho, tamanho)
+    return ImageFont.load_default()
+
+
+def gerar_card_capitulo(titulo, largura, altura, duracao=None):
+    """
+    Card preto de transição entre capítulos (formato webdoc tipo Elementar): título
+    do capítulo centralizado em branco sobre fundo preto, com fade in/out suave.
+
+    Sincronismo: esse clipe é posicionado (por quem chama, em criar_video_longo) EXATAMENTE
+    no timestamp de início do bloco de capítulo correspondente — que é também o instante
+    em que o narrador começa a FALAR esse mesmo título (ver gerar_prosa_capitulos no
+    roteiro_engine.py, que prefixa o texto do bloco com o título falado). Por isso a
+    duração default é curta (pensada pra cobrir só o tempo de falar um título de 3-6
+    palavras, não o capítulo inteiro) — ajustável via config.json ('duracao_card_capitulo').
+    """
+    from moviepy.editor import ImageClip
+
+    duracao = duracao if duracao is not None else float(config.get('duracao_card_capitulo', 2.2))
+    largura_texto = int(largura * 0.8)
+
+    img = Image.new('RGB', (largura, altura), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    titulo_upper = titulo.upper()
+    fontsize = int(largura / 14)
+    fonte = _carregar_fonte_pil_destaque(fontsize)
+    for _tentativa in range(6):
+        fonte = _carregar_fonte_pil_destaque(fontsize)
+        bbox = draw.textbbox((0, 0), titulo_upper, font=fonte)
+        largura_medida = (bbox[2] - bbox[0]) * 1.08
+        if largura_medida <= largura_texto or fontsize <= 30:
+            break
+        fontsize = max(30, int(fontsize * largura_texto / largura_medida))
+
+    bbox = draw.textbbox((0, 0), titulo_upper, font=fonte)
+    x = (largura - (bbox[2] - bbox[0])) / 2 - bbox[0]
+    y = (altura - (bbox[3] - bbox[1])) / 2 - bbox[1]
+    draw.text((x, y), titulo_upper, font=fonte, fill=(255, 255, 255))
+
+    caminho_temp = os.path.join(ASSETS_DIR, f'_card_capitulo_{abs(hash(titulo_upper)) % 100000}.png')
+    img.save(caminho_temp)
+
+    fade = min(0.4, duracao / 4)
+    clip = ImageClip(caminho_temp).set_duration(duracao).fadein(fade).fadeout(fade)
+    return clip
 
 
 def pesquisar_foto_pexels(termo):
@@ -1693,6 +1838,7 @@ def main():
         tipo_video=VIDEO_TYPE,
         gemini_generate_fn=_gemini_generate,
         modo_roteiro=config.get('modo_roteiro', 'cadeia_completa'),
+        num_capitulos=config.get('num_capitulos_webdoc', 3),
     )
     roteiro = pacote_roteiro['roteiro_texto']
     titulo_video = pacote_roteiro['titulo']
@@ -1764,6 +1910,7 @@ def main():
         termo = escolher_termo_pesquisa(tema, roteiro)
         lista_clipes = baixar_clipes_pexels(termo, orientacao, duracao_bloco_video)
         clips_legenda, clips_destaque, eventos_sfx = [], [], []
+        blocos_com_tempo = []  # sem isso, criar_video_longo(blocos_com_tempo=...) abaixo quebraria com NameError
 
     if not lista_clipes:
         print("❌ Nenhum clipe baixado — abortando este ciclo.")
@@ -1781,7 +1928,7 @@ def main():
         else:
             resultado = criar_video_longo(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
                                            clips_legenda=clips_legenda, clips_destaque=clips_destaque,
-                                           eventos_sfx=eventos_sfx)
+                                           eventos_sfx=eventos_sfx, blocos_com_tempo=blocos_com_tempo)
 
         if not resultado:
             print("❌ Erro ao criar vídeo")

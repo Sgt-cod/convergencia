@@ -1,0 +1,61 @@
+name: Compilação Semanal de Shorts
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'  # Segunda-feira 10h BRT (13h UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Instalar dependências Python
+        run: |
+          pip install --upgrade pip
+          pip install requests google-generativeai \
+            google-auth google-auth-oauthlib google-api-python-client \
+            edge-tts "moviepy==2.0.0" pillow numpy feedparser
+
+      - name: Gerar vídeo longo semanal
+        env:
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_CREDENTIALS: ${{ secrets.YOUTUBE_CREDENTIALS }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CANAL_ID:   ${{ secrets.TELEGRAM_CANAL_ID }}
+          BLOGGER_BLOG_ID:     ${{ secrets.BLOGGER_BLOG_ID }}
+          BLOGGER_CREDENTIALS: ${{ secrets.BLOGGER_CREDENTIALS }}
+          CANAL_YOUTUBE_URL:   ${{ secrets.CANAL_YOUTUBE_URL }}
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:         ${{ github.repository }}
+        run: python compilar_shorts.py
+
+      - name: Commit log atualizado
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git pull --rebase origin main || true
+          git add videos_gerados.json
+          git diff --staged --quiet || git commit -m "🎬 Compilação semanal - $(date +'%Y-%m-%d')"
+          git push || echo "Nada para commitar"

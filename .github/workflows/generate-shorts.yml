@@ -1,0 +1,79 @@
+name: Gerar Shorts
+
+on:
+  schedule:
+    - cron: '0 10 * * *'  # 07:00 BRT (UTC-3), todos os dias
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gerar-short:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Instalar FFmpeg e ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg imagemagick
+
+      - name: Liberar política do ImageMagick (necessário para legendas)
+        run: |
+          POLICY_FILE="/etc/ImageMagick-6/policy.xml"
+          if [ -f "$POLICY_FILE" ]; then
+            sudo sed -i 's/rights="none"/rights="read|write"/g' "$POLICY_FILE"
+            sudo sed -i '/pattern="@\*"/d' "$POLICY_FILE"
+          fi
+
+      - name: Instalar dependências Python
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Gerar short
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          YOUTUBE_CREDENTIALS: ${{ secrets.YOUTUBE_CREDENTIALS }}
+          FISHAUDIO_API_KEY: ${{ secrets.FISHAUDIO_API_KEY }}
+          FISHAUDIO_VOICE_ID: ${{ secrets.FISHAUDIO_VOICE_ID }}
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          USAR_CURACAO: "false"
+          VIDEO_TYPE: short
+          # ── Descomente pra testar sem publicar / mais rápido ──────────────
+          # PULAR_UPLOAD: "true"
+          # LIMITE_CLIPES_TESTE: "2"
+          # ── Ajustes opcionais (já têm padrão sensato no código) ───────────
+          # DURACAO_MAXIMA_CLIPE: "20"
+          # ATIVAR_LEGENDA: "true"
+        run: python generate_video.py
+
+      - name: Commit logs atualizados
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          touch videos_gerados.json temas_usados.json
+          git add -f videos_gerados.json temas_usados.json
+          git diff --staged --quiet || git commit -m "📱 Novo short gerado - $(date +'%Y-%m-%d %H:%M')"
+          git fetch origin main
+          git pull origin main --rebase
+          git push origin main || git push --force-with-lease origin main
+
+      - name: Upload short como artefato
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-${{ github.run_number }}
+          path: videos/*.mp4
+          retention-days: 7

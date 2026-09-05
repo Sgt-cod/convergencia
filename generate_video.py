@@ -79,7 +79,10 @@ SEGUNDOS_FADEOUT = float(os.environ.get('SEGUNDOS_FADEOUT', '2'))   # fade-out n
 # ── Duração máxima por clipe do Pexels ───────────────────────────────────────
 # Evita que um único vídeo longo (ex: 2min) preencha o short inteiro sozinho.
 # Ajuste entre 15 e 30 conforme preferir mais ou menos variedade de cortes.
-DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '20'))
+DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '14'))  # dinamismo: nada fica mais que isso na tela
+# Teto de quanto tempo um print de notícia fica sozinho na tela — o resto do bloco
+# (se a narração daquele trecho for mais longa que isso) cai pro B-roll normal.
+DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
@@ -879,6 +882,14 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
         # não estiver ligada — bloco.get() volta None e cai direto no fluxo antigo abaixo.
         if bloco.get('usa_print_noticia'):
             try:
+                # BUGFIX (print ficando ~1min na tela): antes usava duracao_alvo (a
+                # duração INTEIRA do bloco de narração) pro print inteiro — se o bloco
+                # tinha 40-60s de fala, o print ficava parado na tela esse tempo todo.
+                # Cap: só o tempo que o roteiro realmente está "falando sobre" a
+                # matéria (config 'duracao_maxima_print_noticia', default 9s) — o
+                # RESTO do bloco cai pro fluxo normal de B-roll logo abaixo (mesmo
+                # while loop, só que começando com tempo_coberto > 0 em vez de 0).
+                duracao_print = min(duracao_alvo, DURACAO_MAXIMA_PRINT_NOTICIA)
                 caminho_print = gerar_print_noticia(
                     manchete=bloco['manchete_noticia'],
                     subtitulo=bloco.get('subtitulo_noticia'),
@@ -887,20 +898,45 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                 todos_os_clipes.append({
                     'path': caminho_print,
                     'inicio': offset_bloco,
-                    'duracao': duracao_alvo,
+                    'duracao': duracao_print,
                     'transicao_bloco': True,
                 })
-                print(f"    📰 Print de notícia gerado: \"{bloco['manchete_noticia']}\"")
-                continue
+                print(f"    📰 Print de notícia gerado ({duracao_print:.1f}s): \"{bloco['manchete_noticia']}\"")
+                tempo_coberto = duracao_print  # o resto do bloco (se sobrar) vira B-roll normal abaixo
             except Exception as e:
                 print(f"    ⚠️ Falha ao gerar print de notícia ({e}) — caindo pro B-roll normal")
+                tempo_coberto = 0.0
+        else:
+            tempo_coberto = 0.0
 
-        tempo_coberto = 0.0
         pagina = 1
         while tempo_coberto < duracao_alvo and pagina <= MAX_PAGINAS_BLOCO:
             if LIMITE_CLIPES_TESTE > 0 and len(todos_os_clipes) >= LIMITE_CLIPES_TESTE:
                 print(f"   ✂️ MODO TESTE: limitado a {LIMITE_CLIPES_TESTE} clipe(s) no total")
                 return todos_os_clipes
+
+            # Diversidade de mídia (config 'pesos_fontes_midia'): antes de buscar mais
+            # vídeo no Pexels, sorteia se esse "slot" deveria vir de Wikimedia/Internet
+            # Archive/Agnes — sem isso configurado, sempre cai no Pexels normal (100%
+            # compatível com o comportamento antigo). Cada slot alternativo dura entre
+            # 10 e 14s (config 'duracao_slot_midia_alternativa_min/max') — dinamismo,
+            # sem ficar muito tempo parado numa imagem só.
+            caminho_alt, fonte_alt = None, None
+            if duracao_alvo - tempo_coberto >= 3:  # não vale a pena buscar fonte alternativa pra um resto minúsculo
+                caminho_alt, fonte_alt = _escolher_fonte_midia_alternativa(termo)
+            if caminho_alt:
+                min_s = config.get('duracao_slot_midia_alternativa_min', 10)
+                max_s = config.get('duracao_slot_midia_alternativa_max', 14)
+                duracao_slot = min(random.uniform(min_s, max_s), duracao_alvo - tempo_coberto)
+                todos_os_clipes.append({
+                    'path': caminho_alt,
+                    'inicio': offset_bloco + tempo_coberto,
+                    'duracao': duracao_slot,
+                    'transicao_bloco': (tempo_coberto == 0.0),
+                    'fonte': fonte_alt,
+                })
+                tempo_coberto += duracao_slot
+                continue  # próxima volta do while decide de novo (Pexels ou outra fonte)
 
             videos_encontrados = pesquisar_videos_pexels(termo, orientacao, pagina=pagina)
             if not videos_encontrados:
@@ -990,11 +1026,13 @@ ANTECIPACAO_SFX_TRANSICAO = float(os.environ.get(
 TRANSICOES_VIDEO = config.get('transicoes_video', ['crossfade'])  # ['crossfade','flash','glitch','shadow_wipe']
 
 
-def _clip_de_imagem_com_zoom(caminho_imagem, duracao, largura, altura, zoom_final=1.08):
+def _clip_de_imagem_com_zoom(caminho_imagem, duracao, largura, altura, zoom_final=1.08, zoom_inicial=1.0):
     """
-    Ken Burns simples (zoom lento e contínuo) pra imagens estáticas — usado pelos
-    prints de notícia gerados em mockups_visuais.py. Sem isso, uma imagem 100% parada
-    destoa visualmente do resto do B-roll (que sempre tem movimento de câmera real).
+    Ken Burns simples (zoom lento e contínuo) pra imagens estáticas. zoom_inicial <
+    zoom_final = zoom IN (padrão, usado nos prints de notícia); zoom_inicial > zoom_final
+    = zoom OUT (usado nas fotos de arquivo do Wikimedia/Internet Archive, ver
+    _clip_de_imagem_vintage) — dá uma sensação diferente, mais "revelando a cena",
+    reforçando que aquela imagem é de outra fonte (arquivo/histórica), não B-roll comum.
     """
     img_clip = ImageClip(caminho_imagem).set_duration(duracao)
     if img_clip.w / img_clip.h > largura / altura:
@@ -1003,14 +1041,183 @@ def _clip_de_imagem_com_zoom(caminho_imagem, duracao, largura, altura, zoom_fina
         img_clip = img_clip.resize(width=largura)
 
     def _fator_zoom(t):
-        return 1 + (zoom_final - 1) * (t / duracao if duracao > 0 else 1)
+        progresso = t / duracao if duracao > 0 else 1
+        return zoom_inicial + (zoom_final - zoom_inicial) * progresso
 
     img_clip = img_clip.resize(_fator_zoom).set_position('center')
     return CompositeVideoClip([img_clip], size=(largura, altura)).set_duration(duracao)
 
 
+def _aplicar_vinheta_vintage(caminho_imagem, output_path, intensidade=0.55):
+    """
+    Escurece as bordas (vinheta radial) e reduz levemente saturação/contraste — efeito
+    'vintage' pra diferenciar visualmente fotos de arquivo (Wikimedia Commons/Internet
+    Archive) do B-roll de vídeo comum, reforçando a sensação de material histórico/de
+    apuração em vez de imagem de banco genérico.
+    """
+    from PIL import ImageEnhance
+
+    img = Image.open(caminho_imagem).convert('RGB')
+    w, h = img.size
+
+    img = ImageEnhance.Color(img).enhance(0.75)
+    img = ImageEnhance.Contrast(img).enhance(1.08)
+    img = ImageEnhance.Brightness(img).enhance(0.95)
+
+    vinheta = Image.new('L', (w, h), 0)
+    draw_v = ImageDraw.Draw(vinheta)
+    max_raio = int(((w ** 2 + h ** 2) ** 0.5) / 2)
+    passo = max(1, max_raio // 120)  # ~120 aneis, suficiente pra suavidade sem ser lento
+    # alpha ALTO (255, imagem visível) no CENTRO, alpha BAIXO (mais preto) nas BORDAS —
+    # desenha do maior raio (borda) pro menor (centro), então o centro fica por cima.
+    for r in range(max_raio, 0, -passo):
+        alpha = int(255 * (1 - intensidade * (r / max_raio)))
+        alpha = max(0, min(255, alpha))
+        draw_v.ellipse([w / 2 - r, h / 2 - r, w / 2 + r, h / 2 + r], fill=alpha)
+
+    preto = Image.new('RGB', (w, h), (0, 0, 0))
+    img = Image.composite(img, preto, vinheta)
+    img.save(output_path, quality=92)
+    return output_path
+
+
+def _clip_de_imagem_vintage(caminho_imagem, duracao, largura, altura):
+    """Zoom lento PRA FORA + vinheta vintage — usado só pras imagens de arquivo real
+    (Wikimedia Commons / Internet Archive), nunca pro B-roll de vídeo comum."""
+    caminho_vintage = os.path.splitext(caminho_imagem)[0] + '_vintage.jpg'
+    _aplicar_vinheta_vintage(caminho_imagem, caminho_vintage)
+    return _clip_de_imagem_com_zoom(caminho_vintage, duracao, largura, altura,
+                                     zoom_inicial=1.15, zoom_final=1.0)
+
+
+def buscar_imagem_wikimedia(termo, output_dir=None):
+    """
+    Busca uma imagem no Wikimedia Commons (100% grátis, sem chave) relacionada ao termo.
+    Não precisamos filtrar licença manualmente — é condição de hospedagem no Commons que
+    todo arquivo já tenha licença livre (domínio público ou Creative Commons). Retorna o
+    caminho do arquivo baixado, ou None se não achar nada usável (o chamador cai pro
+    Pexels sem quebrar o vídeo).
+    """
+    output_dir = output_dir or f'{ASSETS_DIR}/wikimedia'
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        params = {
+            'action': 'query', 'generator': 'search',
+            'gsrsearch': f'{termo} filetype:bitmap', 'gsrnamespace': 6, 'gsrlimit': 10,
+            'prop': 'imageinfo', 'iiprop': 'url|mime', 'iiurlwidth': 1920, 'format': 'json',
+        }
+        resp = requests.get('https://commons.wikimedia.org/w/api.php', params=params, timeout=20,
+                             headers={'User-Agent': 'WebdocPipeline/1.0 (uso educacional/canal YouTube)'})
+        resp.raise_for_status()
+        paginas = list(resp.json().get('query', {}).get('pages', {}).values())
+        random.shuffle(paginas)
+
+        for pagina in paginas:
+            info = (pagina.get('imageinfo') or [None])[0]
+            if not info:
+                continue
+            mime = info.get('mime', '')
+            if not mime.startswith('image/') or mime == 'image/svg+xml':
+                continue  # SVG (mapa/diagrama vetorial) não presta como B-roll fotográfico
+            url = info.get('thumburl') or info.get('url')
+            if not url:
+                continue
+            destino = os.path.join(output_dir, f"wm_{pagina.get('pageid')}.jpg")
+            img_resp = requests.get(url, timeout=30)
+            img_resp.raise_for_status()
+            with open(destino, 'wb') as f:
+                f.write(img_resp.content)
+            print(f"    🖼️ Wikimedia Commons: \"{pagina.get('title', '')}\"")
+            return destino
+    except Exception as e:
+        print(f"    ⚠️ Wikimedia Commons falhou ({e})")
+    return None
+
+
+def buscar_imagem_internet_archive(termo, output_dir=None):
+    """
+    Busca uma imagem de domínio público/licença livre no Internet Archive relacionada
+    ao termo — bom pra material de arquivo/histórico que não existe em banco de vídeo
+    stock comum. 100% grátis, sem chave. Retorna o caminho baixado ou None.
+    """
+    output_dir = output_dir or f'{ASSETS_DIR}/internet_archive'
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        params = {'q': f'{termo} AND mediatype:image', 'rows': 10, 'output': 'json'}
+        params['fl[]'] = ['identifier', 'title']
+        resp = requests.get('https://archive.org/advancedsearch.php', params=params, timeout=20)
+        resp.raise_for_status()
+        docs = resp.json().get('response', {}).get('docs', [])
+        random.shuffle(docs)
+
+        for doc in docs:
+            identifier = doc.get('identifier')
+            if not identifier:
+                continue
+            meta_resp = requests.get(f'https://archive.org/metadata/{identifier}', timeout=20)
+            meta_resp.raise_for_status()
+            arquivos = meta_resp.json().get('files', [])
+            candidatos = [a for a in arquivos
+                          if a.get('name', '').lower().endswith(('.jpg', '.jpeg', '.png'))
+                          and a.get('source') == 'original']
+            if not candidatos:
+                continue
+            arquivo = random.choice(candidatos)
+            url = f"https://archive.org/download/{identifier}/{arquivo['name']}"
+            destino = os.path.join(output_dir, f"ia_{identifier}_{os.path.basename(arquivo['name'])}")
+            img_resp = requests.get(url, timeout=30)
+            img_resp.raise_for_status()
+            with open(destino, 'wb') as f:
+                f.write(img_resp.content)
+            print(f"    📼 Internet Archive: \"{doc.get('title', identifier)}\"")
+            return destino
+    except Exception as e:
+        print(f"    ⚠️ Internet Archive falhou ({e})")
+    return None
+
+
+def _escolher_fonte_midia_alternativa(termo):
+    """
+    Sorteia (com pesos configuráveis) se o próximo "slot" de B-roll de um bloco deve vir
+    de uma fonte alternativa ao Pexels — Wikimedia Commons, Internet Archive ou Agnes AI
+    (gerada). Retorna (caminho_arquivo, fonte) ou (None, None) se sorteou Pexels, se a
+    fonte sorteada falhou, ou se nenhum peso > 0 estiver configurado. O chamador SEMPRE
+    tem o Pexels como fallback — isso aqui só decide se tenta OUTRA coisa PRIMEIRO.
+
+    Pesos em config.json → 'pesos_fontes_midia': {"pexels": 0.5, "wikimedia": 0.2,
+    "internet_archive": 0.15, "agnes": 0.15}. Sem essa chave, o padrão é 100% Pexels
+    (comportamento antigo, opt-in pra diversidade de fonte).
+    """
+    pesos = config.get('pesos_fontes_midia', {'pexels': 1.0})
+    fontes = list(pesos.keys())
+    valores = list(pesos.values())
+    if sum(valores) <= 0:
+        return None, None
+    escolhida = random.choices(fontes, weights=valores, k=1)[0]
+
+    if escolhida == 'pexels':
+        return None, None
+    if escolhida == 'wikimedia':
+        caminho = buscar_imagem_wikimedia(termo)
+        return (caminho, 'wikimedia') if caminho else (None, None)
+    if escolhida == 'internet_archive':
+        caminho = buscar_imagem_internet_archive(termo)
+        return (caminho, 'internet_archive') if caminho else (None, None)
+    if escolhida == 'agnes':
+        caminho = f"{ASSETS_DIR}/agnes/broll_{abs(hash(termo + str(random.random()))) % 100000}.jpg"
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        resultado = gerar_imagem_agnes(termo, caminho)
+        return (resultado, 'agnes') if resultado else (None, None)
+    return None, None
+
+
 def _preparar_clip_pexels(item, largura, altura):
     if item['path'].lower().endswith(('.png', '.jpg', '.jpeg')):
+        # Wikimedia/Internet Archive usam zoom-out + vinheta vintage (ver
+        # _escolher_fonte_midia_alternativa) — Agnes e print de notícia usam o zoom-in
+        # normal, porque são imagens "novas"/geradas, não material de arquivo.
+        if item.get('fonte') in ('wikimedia', 'internet_archive'):
+            return _clip_de_imagem_vintage(item['path'], item['duracao'], largura, altura).set_start(item['inicio'])
         return _clip_de_imagem_com_zoom(item['path'], item['duracao'], largura, altura).set_start(item['inicio'])
 
     clip = VideoFileClip(item['path'])
@@ -1594,7 +1801,13 @@ def _cortar_para_ratio(img, largura, altura):
 
 
 def _gerar_thumbnail_pexels_agnes(titulo, termo, output_path, largura, altura):
-    """Método padrão: imagem de fundo via Agnes AI (fallback Pexels) + faixa preta no topo com título."""
+    """
+    Fundo via Agnes AI (fallback Pexels) + título em 2-3 linhas na LATERAL (esquerda
+    ou direita, sorteado por vídeo — não sempre o mesmo lado), SEM faixa sólida atrás:
+    cada letra ganha um contorno preto grosso, que garante legibilidade sobre qualquer
+    fundo sem precisar cobrir a imagem com uma barra. Mantém o esquema de duas cores
+    (branco + amarelo no "gancho" final) do estilo de referência do canal.
+    """
     caminho_bruto = f"{ASSETS_DIR}/thumb_bruta.jpg"
 
     resultado_agnes = gerar_imagem_agnes(termo, caminho_bruto)
@@ -1618,43 +1831,64 @@ def _gerar_thumbnail_pexels_agnes(titulo, termo, output_path, largura, altura):
 
     img = Image.open(caminho_bruto).convert('RGB')
     img = _cortar_para_ratio(img, largura, altura)
-
     draw = ImageDraw.Draw(img)
-    altura_faixa = int(altura / 5)
-    draw.rectangle([(0, 0), (largura, altura_faixa)], fill=(0, 0, 0))
 
-    palavras = titulo.split()
-    meio = max(1, len(palavras) // 2)
-    parte1 = " ".join(palavras[:meio])
-    parte2 = " ".join(palavras[meio:])
+    lado = random.choice(['esquerda', 'direita'])
+    largura_texto_max = int(largura * 0.46)
+    margem = int(largura * 0.05)
 
-    tamanho_fonte = int(altura_faixa * 0.78)
-    tamanho_minimo = int(altura_faixa * 0.30)
-    espaco = 24
+    palavras = titulo.upper().split()
+    # última 1-2 palavras = o "gancho" em amarelo (ex: "A INFLAÇÃO" branco / "INVISÍVEL?"
+    # amarelo, "A MÁFIA DOS" branco / "PERFUMES?" amarelo — mesmo padrão dos exemplos)
+    n_destaque = 2 if len(palavras) > 4 else 1
+    palavras_base = palavras[:-n_destaque] if len(palavras) > n_destaque else []
+    palavras_destaque = palavras[-n_destaque:] if palavras else palavras
 
+    def _quebrar(lista_palavras, fonte):
+        linhas, atual = [], []
+        for p in lista_palavras:
+            teste = " ".join(atual + [p])
+            bbox = draw.textbbox((0, 0), teste, font=fonte)
+            if bbox[2] - bbox[0] <= largura_texto_max or not atual:
+                atual.append(p)
+            else:
+                linhas.append(" ".join(atual))
+                atual = [p]
+        if atual:
+            linhas.append(" ".join(atual))
+        return linhas
+
+    tamanho_fonte = int(altura * 0.15)
+    tamanho_minimo = int(altura * 0.05)
+    fonte, linhas_base, linhas_destaque = None, [], []
     while tamanho_fonte >= tamanho_minimo:
         fonte = _carregar_fonte_pil(tamanho_fonte)
-        bbox1 = draw.textbbox((0, 0), parte1, font=fonte)
-        bbox2 = draw.textbbox((0, 0), parte2, font=fonte)
-        largura1 = bbox1[2] - bbox1[0]
-        largura2 = bbox2[2] - bbox2[0]
-        if largura1 + espaco + largura2 <= largura * 0.94:
+        linhas_base = _quebrar(palavras_base, fonte) if palavras_base else []
+        linhas_destaque = _quebrar(palavras_destaque, fonte)
+        if len(linhas_base) + len(linhas_destaque) <= 3:  # no máx. 3 linhas no total
             break
-        tamanho_fonte = int(tamanho_fonte * 0.9)
+        tamanho_fonte = int(tamanho_fonte * 0.92)
 
-    if largura1 + espaco + largura2 <= largura * 0.94:
-        x = (largura - (largura1 + espaco + largura2)) // 2
-        y = (altura_faixa - (bbox1[3] - bbox1[1])) // 2
-        draw.text((x, y), parte1, font=fonte, fill=(255, 215, 0))
-        draw.text((x + largura1 + espaco, y), parte2, font=fonte, fill=(255, 255, 255))
-    else:
-        fonte = _carregar_fonte_pil(int(altura_faixa * 0.30))
-        bbox1 = draw.textbbox((0, 0), parte1, font=fonte)
-        bbox2 = draw.textbbox((0, 0), parte2, font=fonte)
-        y1 = int(altura_faixa * 0.06)
-        y2 = int(altura_faixa * 0.52)
-        draw.text(((largura - (bbox1[2] - bbox1[0])) // 2, y1), parte1, font=fonte, fill=(255, 215, 0))
-        draw.text(((largura - (bbox2[2] - bbox2[0])) // 2, y2), parte2, font=fonte, fill=(255, 255, 255))
+    todas_linhas = [(l, (255, 255, 255)) for l in linhas_base] + [(l, (255, 209, 0)) for l in linhas_destaque]
+    espacamento_linha = 1.15
+    alturas_linha = [draw.textbbox((0, 0), l, font=fonte)[3] - draw.textbbox((0, 0), l, font=fonte)[1]
+                      for l, _ in todas_linhas]
+    altura_total = sum(int(h * espacamento_linha) for h in alturas_linha)
+    y = int(altura * 0.5 - altura_total / 2)
+
+    contorno = max(3, tamanho_fonte // 16)
+    for linha, cor in todas_linhas:
+        bbox = draw.textbbox((0, 0), linha, font=fonte)
+        largura_linha = bbox[2] - bbox[0]
+        x = margem if lado == 'esquerda' else (largura - margem - largura_linha)
+        # contorno preto grosso em vez de faixa sólida — legível sobre qualquer fundo
+        # sem precisar cobrir parte da imagem gerada
+        for dx in range(-contorno, contorno + 1, max(1, contorno // 2)):
+            for dy in range(-contorno, contorno + 1, max(1, contorno // 2)):
+                if dx or dy:
+                    draw.text((x + dx, y + dy), linha, font=fonte, fill=(0, 0, 0))
+        draw.text((x, y), linha, font=fonte, fill=cor)
+        y += int((bbox[3] - bbox[1]) * espacamento_linha)
 
     img.save(output_path, quality=90)
     return output_path
@@ -1925,113 +2159,4 @@ def main():
         print("✨ Escolhendo palavras de destaque...")
         destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo, _gemini_generate)
         destaques_resolvidos = resolver_destaques_com_tempo(
-            roteiro, palavras_tempo, blocos_com_tempo, destaques_por_bloco
-        )
-        eventos_sfx = construir_timeline_sfx(blocos_com_tempo, destaques_resolvidos)
-
-        largura_legenda = 1080 if VIDEO_TYPE == 'short' else 1920
-        altura_legenda = 1920 if VIDEO_TYPE == 'short' else 1080
-        offset_legenda = SEGUNDOS_LEAD_IN  # NÃO inclui intro — quem soma intro_duracao é criar_video_longo
-        clips_legenda = gerar_clips_legenda(roteiro, palavras_tempo, largura_legenda, altura_legenda,
-                                             offset=offset_legenda)
-        clips_destaque = gerar_clips_destaque(roteiro, palavras_tempo, destaques_resolvidos,
-                                               largura_legenda, altura_legenda, offset=offset_legenda)
-        termo = termos_por_bloco[0] if termos_por_bloco else ''  # usado só na busca de foto da thumbnail
-    else:
-        # sem timestamps não dá pra fazer nada da Fase 2 — cai pro comportamento antigo
-        # (1 termo pro vídeo inteiro, sem legenda/destaque/SFX sincronizados)
-        termo = escolher_termo_pesquisa(tema, roteiro)
-        lista_clipes = baixar_clipes_pexels(termo, orientacao, duracao_bloco_video)
-        clips_legenda, clips_destaque, eventos_sfx = [], [], []
-        blocos_com_tempo = []  # sem isso, criar_video_longo(blocos_com_tempo=...) abaixo quebraria com NameError
-
-    if not lista_clipes:
-        print("❌ Nenhum clipe baixado — abortando este ciclo.")
-        return
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    video_path = f'{VIDEOS_DIR}/{VIDEO_TYPE}_{timestamp}.mp4'
-
-    print("🎥 Montando vídeo...")
-    try:
-        if VIDEO_TYPE == 'short':
-            resultado = criar_video_curto(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
-                                           clips_legenda=clips_legenda, clips_destaque=clips_destaque,
-                                           eventos_sfx=eventos_sfx)
-        else:
-            resultado = criar_video_longo(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
-                                           clips_legenda=clips_legenda, clips_destaque=clips_destaque,
-                                           eventos_sfx=eventos_sfx, blocos_com_tempo=blocos_com_tempo)
-
-        if not resultado:
-            print("❌ Erro ao criar vídeo")
-            return
-        print("✅ Vídeo criado!")
-    except Exception as e:
-        print(f"❌ Erro: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
-    titulo = titulo_video[:60] if len(titulo_video) <= 60 else titulo_video[:57] + '...'
-    if VIDEO_TYPE == 'short':
-        titulo += ' #shorts'
-
-    texto_inscricao = config.get('texto_inscricao', '🔔 Inscreva-se para reflexões diárias!')
-    hashtag_conteudo = config.get('hashtag_conteudo', 'reflexao')
-    descricao_pacote = pacote_roteiro.get('descricao') or {}
-    corpo_descricao = (
-        f"{descricao_pacote.get('abertura_seo', '')}\n\n{descricao_pacote.get('corpo', '')}"
-        if descricao_pacote.get('corpo') else roteiro[:300] + '...'
-    )
-    descricao = corpo_descricao + f'\n\n{texto_inscricao}\n#' + \
-                ('shorts' if VIDEO_TYPE == 'short' else hashtag_conteudo)
-    tags = config.get('tags_padrao', ['reflexao crista', 'motivacional', 'fe', 'inspiracao'])
-    if VIDEO_TYPE == 'short':
-        tags.append('shorts')
-
-    _salvar_tema_usado(tema)
-
-    if PULAR_UPLOAD:
-        print(f"\n⏭️ PULAR_UPLOAD ativo — vídeo NÃO será publicado. Disponível em: {video_path}")
-        print("=" * 60)
-        print("✅ TESTE CONCLUÍDO (sem publicação)")
-        print("=" * 60)
-        return
-
-    print("\n📤 Upload YouTube...")
-    try:
-        print("🖼️ Gerando thumbnail...")
-        texto_thumb = gerar_texto_thumbnail(titulo_video, tema)
-        print(f"   Texto da thumb: {texto_thumb}")
-        thumbnail_path = gerar_thumbnail(texto_thumb, termo, f'{ASSETS_DIR}/thumbnail.jpg')
-
-        video_id = fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path)
-        url = f'https://youtube.com/{"shorts/" if VIDEO_TYPE == "short" else "watch?v="}{video_id}'
-        print(f"✅ Publicado!\n🔗 {url}")
-
-        log_entry = {
-            'data': datetime.now().isoformat(), 'tipo': VIDEO_TYPE, 'tema': tema,
-            'titulo': titulo, 'duracao': duracao_narracao, 'video_id': video_id, 'url': url
-        }
-        log_file = 'videos_gerados.json'
-        logs = []
-        if os.path.exists(log_file):
-            with open(log_file, 'r', encoding='utf-8') as f:
-                logs = json.load(f)
-        logs.append(log_entry)
-        with open(log_file, 'w', encoding='utf-8') as f:
-            json.dump(logs, f, indent=2, ensure_ascii=False)
-
-    except Exception as e:
-        print(f"❌ Erro no upload YouTube: {e}")
-        import traceback
-        traceback.print_exc()
-
-    print("\n" + "=" * 60)
-    print("✅ WORKFLOW CONCLUÍDO")
-    print("=" * 60)
-
-
-if __name__ == '__main__':
-    main()
+            roteiro, palavras_tempo, blocos_

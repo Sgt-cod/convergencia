@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import *
 from google import generativeai as genai
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -42,7 +43,9 @@ ASSETS_DIR = 'assets'
 VIDEO_TYPE = os.environ.get('VIDEO_TYPE', 'short')  # 'short' (vertical) ou 'long' (horizontal)
 
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-YOUTUBE_CREDENTIALS = os.environ.get('YOUTUBE_CREDENTIALS')
+YOUTUBE_CLIENT_ID = os.environ.get('YOUTUBE_CLIENT_ID')
+YOUTUBE_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
+YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 PEXELS_API_KEY = os.environ.get('PEXELS_API_KEY')
 
 # ── Agnes AI (geração de imagem gratuita, para thumbnail) ───────────────────
@@ -1798,8 +1801,30 @@ def gerar_thumbnail(titulo, termo, output_path, largura=1280, altura=720):
 
 
 def fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path=None):
-    creds_dict = json.loads(YOUTUBE_CREDENTIALS)
-    credentials = Credentials.from_authorized_user_info(creds_dict)
+    # BUGFIX (troca de esquema de credencial): antes um único secret YOUTUBE_CREDENTIALS
+    # trazia o JSON inteiro (token, refresh_token, client_id, client_secret, scopes...)
+    # gerado por Credentials.to_json(). Trocamos pra 3 secrets separados — mais simples
+    # de gerar/rotacionar (não depende de guardar o JSON completo em lugar nenhum, só o
+    # client_id/client_secret do app OAuth + o refresh_token dessa conta específica).
+    # Sem 'token' (access token) aqui de propósito — a lib renova ele sozinha usando o
+    # refresh_token, e forçamos isso explicitamente com .refresh() logo abaixo, pra
+    # falhar rápido e com erro claro se o refresh_token estiver errado/revogado, em vez
+    # de um erro genérico e confuso lá na hora do upload em si.
+    if not (YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REFRESH_TOKEN):
+        raise RuntimeError(
+            "Credenciais do YouTube incompletas — defina YOUTUBE_CLIENT_ID, "
+            "YOUTUBE_CLIENT_SECRET e YOUTUBE_REFRESH_TOKEN nos secrets do repositório."
+        )
+
+    credentials = Credentials(
+        token=None,
+        refresh_token=YOUTUBE_REFRESH_TOKEN,
+        client_id=YOUTUBE_CLIENT_ID,
+        client_secret=YOUTUBE_CLIENT_SECRET,
+        token_uri='https://oauth2.googleapis.com/token',
+    )
+    credentials.refresh(GoogleAuthRequest())
+
     youtube = build('youtube', 'v3', credentials=credentials)
 
     body = {

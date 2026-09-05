@@ -84,7 +84,6 @@ SEGUNDOS_FADEOUT = float(os.environ.get('SEGUNDOS_FADEOUT', '2'))   # fade-out n
 DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '14'))  # dinamismo: nada fica mais que isso na tela
 # Teto de quanto tempo um print de notícia fica sozinho na tela — o resto do bloco
 # (se a narração daquele trecho for mais longa que isso) cai pro B-roll normal.
-DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
@@ -117,6 +116,8 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
+
+DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
 # pra clonar o canal em outro idioma, sem tocar no código.
 IDIOMA_CONTEUDO = config.get('idioma_conteudo', 'português do Brasil')

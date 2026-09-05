@@ -280,16 +280,21 @@ def resolver_destaques_com_tempo(roteiro, palavras_tempo, blocos_com_tempo, dest
 
 def construir_timeline_sfx(blocos_com_tempo, destaques_resolvidos):
     """
-    Dois tipos de evento, cada um mapeado depois pra uma pasta de SFX própria em
-    generate_video.py (assets/sfx/transicao/, assets/sfx/destaque/):
-      - 'transicao': toda troca de bloco (mesmo momento em que o B-roll troca de termo)
+    Três tipos de evento, cada um mapeado depois pra uma pasta de SFX própria em
+    generate_video.py (assets/sfx/transicao/, assets/sfx/destaque/, assets/sfx/materia/):
+      - 'transicao': troca de bloco pra B-roll normal (whoosh)
       - 'destaque':  todo destaque visual que aparece na tela
+      - 'materia':   troca de bloco QUE ABRE COM PRINT DE NOTÍCIA (mouse-click, não
+                     whoosh — o som de "abrir uma página" combina mais com o mockup de
+                     print do que com uma transição de B-roll)
     """
     eventos = []
 
     for i, bloco in enumerate(blocos_com_tempo):
-        if i > 0:  # não dispara SFX de transição no instante zero do vídeo
-            eventos.append({'tempo': bloco['inicio'], 'tipo': 'transicao'})
+        if i == 0:  # não dispara SFX de transição no instante zero do vídeo
+            continue
+        tipo = 'materia' if bloco.get('usa_print_noticia') else 'transicao'
+        eventos.append({'tempo': bloco['inicio'], 'tipo': tipo})
 
     for destaque in destaques_resolvidos:
         eventos.append({'tempo': destaque['inicio'], 'tipo': 'destaque'})

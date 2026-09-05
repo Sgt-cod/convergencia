@@ -1157,8 +1157,16 @@ def _mixar_musica_por_capitulo(audio_narracao, duracao_total, marcos_capitulos, 
         print(f"  🎼 Capítulo {i + 1}: {os.path.basename(faixas_por_trecho[i])} "
               f"(t={inicio_trecho:.1f}s–{fim_trecho:.1f}s)")
 
+        # BUGFIX: crossfadein/crossfadeout só existem em CLIPES DE VÍDEO no MoviePy
+        # (mexem em máscara/transparência) — em áudio o nome certo é audio_fadein/
+        # audio_fadeout. Aplicamos fade-out na cauda de todo trecho que não é o
+        # último, e fade-in na cabeça de todo trecho que não é o primeiro — as duas
+        # pontas se sobrepõem na janela de 'crossfade' segundos, dando o crossfade
+        # de verdade (sem isso, só a entrada suaviza e a saída corta seco).
         if i > 0:
-            musica = musica.crossfadein(crossfade)
+            musica = musica.audio_fadein(crossfade)
+        if i < n_trechos - 1:
+            musica = musica.audio_fadeout(crossfade)
         trechos_audio.append(musica.set_start(inicio_trecho))
 
     return CompositeAudioClip([audio_narracao] + trechos_audio)

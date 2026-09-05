@@ -4,6 +4,7 @@
   "modo_roteiro": "capitulos_webdoc",
   "num_capitulos_webdoc": 3,
   "duracao_card_capitulo": 2.2,
+  "duracao_maxima_print_noticia": 9,
 
   "voz_fallback": "pt-BR-AntonioNeural",
   "metodo_thumbnail": "pexels_agnes",

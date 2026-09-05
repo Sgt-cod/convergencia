@@ -16,6 +16,7 @@ de jornal real traria, ao custo de não ser um print "autêntico" — é uma ilu
 não uma citação de fonte.
 """
 
+import datetime
 import os
 import random
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -32,6 +33,14 @@ _FONTE_SANS_CANDIDATOS = [
 _NOMES_VEICULO_GENERICOS = [
     "JORNAL DO DIA", "PORTAL NOTÍCIA", "AGÊNCIA INFORME", "DIÁRIO CENTRAL",
     "REDE INFORMA", "GAZETA ATUAL",
+]
+
+# Nomes FICTÍCIOS pro "Por: Fulano" — mesmo espírito do nome de veículo genérico: dá
+# credibilidade visual de print de notícia real sem atribuir a um jornalista de verdade
+# que não escreveu aquilo (evita difamação/atribuição falsa a pessoa real).
+_NOMES_AUTOR_GENERICOS = [
+    "Marcos Ribeiro", "Ana Beatriz Souza", "Carlos Eduardo Lima", "Fernanda Alves",
+    "Rodrigo Martins", "Juliana Costa", "Paulo Henrique Dias", "Camila Ferreira",
 ]
 
 
@@ -109,6 +118,15 @@ def gerar_print_noticia(manchete, subtitulo=None, nome_veiculo=None,
         for linha in _quebrar_linhas(draw, subtitulo, fonte_sub, largura_max)[:3]:
             draw.text((int(largura * 0.05), y), linha, font=fonte_sub, fill=(80, 80, 80))
             y += int(altura * 0.05)
+
+    # --- autor + data (dá credibilidade visual de print real — nome FICTÍCIO, ver
+    # _NOMES_AUTOR_GENERICOS acima; data sorteada nos últimos ~90 dias) ---
+    y += int(altura * 0.025)
+    autor = random.choice(_NOMES_AUTOR_GENERICOS)
+    dias_atras = random.randint(1, 90)
+    data_str = (datetime.date.today() - datetime.timedelta(days=dias_atras)).strftime('%d/%m/%Y')
+    fonte_creditos = _carregar_fonte(_FONTE_SANS_CANDIDATOS, int(altura * 0.026))
+    draw.text((int(largura * 0.05), y), f"Por: {autor} - {data_str}", font=fonte_creditos, fill=(140, 140, 140))
 
     # leve suavização pra não parecer um slide de apresentação
     img = img.filter(ImageFilter.SMOOTH_MORE)

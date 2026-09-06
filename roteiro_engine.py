@@ -281,15 +281,15 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
 
     Esses dois metadados extras (que sobrevivem até blocos_com_tempo, porque
     mapear_tempos_para_blocos faz **bloco ao montar o resultado) são o que
-    generate_video.py usa pra saber ONDE no vídeo inserir o card preto de transição e
-    trocar a música tema — sem precisar mexer em nada do pipeline de TTS/áudio: o
-    timestamp certo já vem de graça do mapeamento por contagem de palavras que já existe.
+    generate_video.py usa pra saber ONDE no vídeo inserir o card preto de transição
+    (mudo, sem narração) e trocar a música tema.
 
-    Truque de sincronismo: o título do capítulo entra FALADO no início do próprio bloco
-    ("A Fábrica de Prédios. " + resto do texto) — assim o card visual, que aparece
-    exatamente no timestamp de início do bloco, casa com o que o narrador está dizendo
-    naquele instante, em vez de aparecer "solto" sobre uma frase qualquer do meio do
-    capítulo.
+    O título do capítulo NÃO entra falado no roteiro (o card é 100% silencioso — só
+    texto na tela) — quem garante que o card apareça no momento certo, numa pausa
+    de verdade (sem narração por cima), é a montagem do áudio em generate_video.py
+    (ver criar_video_webdoc_capitulos), que gera cada capítulo como um arquivo de
+    áudio separado e insere um silêncio real do tamanho do card entre eles antes de
+    concatenar tudo — não é um truque de texto aqui no roteiro.
     """
     estrutura_prosa = {'introducao': estrutura_capitulos['introducao']}
     for i, cap in enumerate(estrutura_capitulos['capitulos']):
@@ -305,22 +305,24 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
         titulo_cap = titulos_capitulos.get(b['bloco'])
         b['titulo_capitulo'] = titulo_cap
         b['inicio_capitulo'] = titulo_cap is not None
-        if titulo_cap:
-            b['texto'] = f"{titulo_cap}. {b['texto']}"
 
     return blocos
 
 
 def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                                     documento_estilo, tipo_video, gemini_generate_fn,
-                                    num_capitulos=3):
+                                    num_capitulos=3, palavras_alvo=None):
     """
     Modo 'capitulos_webdoc' — formato investigativo em capítulos nomeados, cada um com
     card de transição e música própria. Mesmo contrato de saída de gerar_pacote_roteiro
     (roteiro_texto, roteiro_blocos, titulo, descricao), mais 'capitulos_meta' — lista
     pronta de {{'titulo', 'bloco'}} pra quem não quiser vasculhar roteiro_blocos.
     """
-    palavras_alvo = 180 if tipo_video == 'short' else 900  # webdoc investigativo tende a ser mais longo (12-20min)
+    if palavras_alvo is None:
+        # Webdoc investigativo real (tipo Elementar) fica na faixa de 12-20min — a ~140
+        # palavras/minuto de narração falada, isso pede uns 1700-2400 palavras de roteiro.
+        # 900 (valor antigo) dava só uns 4min de vídeo, curto demais pro formato.
+        palavras_alvo = 180 if tipo_video == 'short' else 1800
 
     try:
         print("  🧱 Estágio 1/4 — estrutura em capítulos...")
@@ -333,12 +335,10 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
 
         print("  🔍 Estágio 3/4 — crítica adversarial...")
         blocos = criticar_e_reescrever(blocos, idioma_conteudo, gemini_generate_fn)
-        # criticar_e_reescrever reescreve 'texto' inteiro — se a reescrita tiver comido o
-        # título falado no começo do bloco, recoloca (comparação simples de prefixo)
-        for b in blocos:
-            titulo_cap = b.get('titulo_capitulo')
-            if titulo_cap and not b['texto'].lstrip().startswith(titulo_cap):
-                b['texto'] = f"{titulo_cap}. {b['texto']}"
+        # criticar_e_reescrever reescreve 'texto', mas 'titulo_capitulo'/'inicio_capitulo'
+        # são chaves separadas no dict do bloco — sobrevivem à reescrita sem precisar
+        # de nenhum reforço aqui (diferente de quando o título entrava embutido no
+        # próprio texto falado, que já não é mais o caso).
 
         print("  🏷️ Estágio 4/4 — título e descrição...")
         titulo = gerar_titulo_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn)
@@ -375,16 +375,41 @@ Escreva APENAS o roteiro corrido."""
         }
 
 
+def _resumo_estrutura_para_prompt(estrutura):
+    """
+    Normaliza QUALQUER uma das estruturas de roteiro (devocional OU capítulos) num
+    resumo textual pros prompts de título/descrição. BUGFIX: antes, título e descrição
+    liam direto 'reflexao_central'/'aplicacao_pratica' — chaves que só existem na
+    estrutura devocional. Chamado a partir do modo 'capitulos_webdoc' (estrutura
+    {{introducao, capitulos, desfecho}}), isso retornava string vazia pros dois campos,
+    ou seja, o prompt de título rodava praticamente sem contexto nenhum do vídeo — só
+    o tema cru — o que explica títulos/ganchos fracos e genéricos.
+    """
+    if 'capitulos' in estrutura:
+        partes = [f"INTRODUÇÃO (dado de abertura): {estrutura.get('introducao', '')}"]
+        for i, cap in enumerate(estrutura.get('capitulos', [])):
+            partes.append(f"CAPÍTULO {i + 1} \"{cap.get('titulo', '')}\": {cap.get('cobre', '')}")
+        partes.append(f"DESFECHO: {estrutura.get('desfecho', '')}")
+        return "\n".join(partes)
+    return (f"REFLEXÃO CENTRAL: {estrutura.get('reflexao_central', '')}\n"
+            f"APLICAÇÃO PRÁTICA: {estrutura.get('aplicacao_pratica', '')}")
+
+
 def gerar_titulo_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn):
     prompt = f"""Gere 10 variantes de título de vídeo para YouTube, em {idioma_conteudo}.
 Cada variante prioriza EXPLICITAMENTE um destes critérios (rotule qual):
 - gap_curiosidade: cria uma lacuna de informação sem entregar a resposta
-- especificidade: usa um detalhe concreto do vídeo
-- emocao: nomeia o sentimento/estado que o vídeo aborda
+- especificidade: usa um NÚMERO ou detalhe concreto do vídeo (valor em R$, %, quantidade)
+- emocao: nomeia o sentimento/estado que o vídeo aborda (indignação, choque, injustiça)
 
 TEMA: {tema}
-REFLEXÃO CENTRAL: {estrutura.get('reflexao_central', '')}
-APLICAÇÃO PRÁTICA: {estrutura.get('aplicacao_pratica', '')}
+{_resumo_estrutura_para_prompt(estrutura)}
+
+O título tem que dar pra entender do que o vídeo trata SEM contexto adicional — nunca
+um número ou palavra solta sem gancho (ex: "QUATRO BILHÕES" sozinho não diz nada; "A
+CIDADE QUE GASTOU 4 BILHÕES E NÃO CONSTRUIU NADA" diz). Pense em títulos de documentário
+investigativo: "[Lugar/Coisa específica]: [a virada/problema] | [enquadramento]" — como
+"RS: A Fábrica de Cidades Inúteis?" ou "Por que Condomínios Estão Tão Caros?".
 
 Para cada variante, responda também: esse título serviria pra QUALQUER vídeo desse
 nicho, ou só faz sentido pra ESTE vídeo específico?
@@ -410,8 +435,7 @@ def gerar_descricao_final_simples(tema, estrutura, idioma_conteudo, gemini_gener
     prompt = f"""Escreva a descrição do vídeo em duas partes, em {idioma_conteudo}.
 
 TEMA: {tema}
-REFLEXÃO CENTRAL: {estrutura.get('reflexao_central', '')}
-APLICAÇÃO PRÁTICA: {estrutura.get('aplicacao_pratica', '')}
+{_resumo_estrutura_para_prompt(estrutura)}
 
 1. abertura_seo (até 150 caracteres): termos de busca reais que alguém digitaria sobre
    esse tema — não invente termos.
@@ -556,7 +580,7 @@ Retorne APENAS JSON: {{"abertura_seo": "...", "corpo": "..."}}"""
 
 def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                           documento_estilo, tipo_video, gemini_generate_fn,
-                          modo_roteiro='cadeia_completa', num_capitulos=3):
+                          modo_roteiro='cadeia_completa', num_capitulos=3, palavras_alvo_webdoc=None):
     """
     Roda a cadeia completa (modo_roteiro='cadeia_completa', padrão), o modo simples
     sem tese/objeção (modo_roteiro='simples'), ou o modo webdoc em capítulos nomeados
@@ -574,7 +598,8 @@ def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
     if modo_roteiro == 'capitulos_webdoc':
         return gerar_pacote_roteiro_capitulos(
             tema, contexto_nicho, idioma_conteudo, instrucao_extra, documento_estilo,
-            tipo_video, gemini_generate_fn, num_capitulos=num_capitulos
+            tipo_video, gemini_generate_fn, num_capitulos=num_capitulos,
+            palavras_alvo=palavras_alvo_webdoc
         )
 
     try:

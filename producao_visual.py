@@ -127,6 +127,55 @@ cada termo EXATAMENTE como aparece na lista:
     return resultado
 
 
+# ============================================================
+# 2.0b TERMO ESPECÍFICO POR BLOCO (pra Wikimedia/Internet Archive) — diferente do termo
+# genérico acima (que é sempre um item de uma lista pré-aprovada, pensado pra achar
+# B-ROLL GENÉRICO no Pexels: "escritório", "cidade vista de cima"), aqui é uma entidade
+# REAL e específica (nome de lugar, evento, órgão, lei) mencionada no próprio bloco —
+# sem isso, buscar no Wikimedia com um termo genérico tipo "brazilian city aerial"
+# quase nunca acha a imagem RELACIONADA ao fato específico que o bloco está narrando.
+# ============================================================
+
+def escolher_termos_especificos_por_bloco(blocos_com_tempo, gemini_generate_fn):
+    """
+    Extrai, PARA CADA bloco, uma entidade real e específica mencionada no texto (nome
+    de cidade/lugar, evento histórico, órgão público, lei, empresa) — usada só como
+    query pro Wikimedia Commons/Internet Archive, nunca pro Pexels (que precisa de
+    termo genérico de banco de imagem, não de nome próprio). Se o bloco não mencionar
+    nada específico o bastante pra valer a pena (ex: um bloco de reflexão genérica),
+    o valor fica None — nesse caso _escolher_fonte_midia_alternativa cai pro termo
+    genérico do bloco.
+    """
+    blocos_prompt = "\n".join(
+        f"[{i}] ({b['bloco']}): {b['texto']}" for i, b in enumerate(blocos_com_tempo)
+    )
+    prompt = f"""Para CADA bloco numerado abaixo, extraia UMA entidade real e específica
+mencionada no texto — nome de cidade/lugar, evento histórico, órgão público, lei,
+empresa, monumento. Isso vai virar uma busca de imagem no Wikimedia Commons, então
+precisa ser algo que provavelmente TEM foto lá (lugar/evento/instituição real e
+razoavelmente conhecido) — não invente, não force se o bloco não tiver nada assim.
+
+Se o bloco for genérico (reflexão, transição, sem menção específica), retorne null
+pra ele.
+
+BLOCOS:
+{blocos_prompt}
+
+Retorne APENAS JSON, MESMA ORDEM E QUANTIDADE dos blocos acima:
+{{"termos_especificos": ["Nome específico ou null", null, "..."]}}"""
+
+    try:
+        resposta = gemini_generate_fn(prompt)
+        termos = _extrair_json(resposta.text).get('termos_especificos', [])
+    except Exception as e:
+        print(f"  ⚠️ Falha ao extrair termos específicos por bloco ({e}) — Wikimedia/Internet "
+              f"Archive vão usar o termo genérico do bloco")
+        termos = []
+
+    resultado = []
+    for i in range(len(blocos_com_tempo)):
+        termo = termos[i] if i < len(termos) else None
+        resultado.append(termo if isinstance(termo, str) and termo.strip() else None)
     return resultado
 
 

@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 import requests
 import edge_tts
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import *
 from google import generativeai as genai
@@ -85,7 +86,7 @@ SEGUNDOS_FADEOUT = float(os.environ.get('SEGUNDOS_FADEOUT', '2'))   # fade-out n
 DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '14'))  # dinamismo: nada fica mais que isso na tela
 # Teto de quanto tempo um print de notícia fica sozinho na tela — o resto do bloco
 # (se a narração daquele trecho for mais longa que isso) cai pro B-roll normal.
-
+DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
@@ -118,7 +119,6 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
-DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
 # pra clonar o canal em outro idioma, sem tocar no código.
 IDIOMA_CONTEUDO = config.get('idioma_conteudo', 'português do Brasil')
@@ -343,6 +343,26 @@ def _estimar_duracao_esperada(texto, palavras_por_segundo=2.2):
     return max(n_palavras / palavras_por_segundo, 1.0)
 
 
+def _silencio_audio(duracao, nchannels=2, fps=44100):
+    """
+    BUGFIX (ValueError: operands could not be broadcast together with shapes (N,2)
+    (N,N)): AudioClip(lambda t: 0*t, ...) sem declarar nchannels sai MONO por padrão —
+    ao concatenar/misturar com um áudio de frase REAL (quase sempre estéreo, vindo de
+    mp3), o shape (N,) do silêncio não bate com o (N,2) da fala e o numpy quebra na
+    hora de somar as amostras. Aqui o make_frame já devolve explicitamente um array
+    (N, nchannels) de zeros, e nchannels é setado no objeto — testado e confirmado que
+    resolve o broadcast.
+    """
+    def make_frame(t):
+        if hasattr(t, '__len__'):
+            return np.zeros((len(t), nchannels))
+        return np.zeros(nchannels)
+
+    clip = AudioClip(make_frame, duration=duracao, fps=fps)
+    clip.nchannels = nchannels
+    return clip
+
+
 def criar_audio_fishaudio(texto, output_file):
     """
     Gera a narração completa via Fish Audio, DIVIDINDO O ROTEIRO EM FRASES em vez de mandar
@@ -395,7 +415,7 @@ def criar_audio_fishaudio(texto, output_file):
     # palavra, porque essa junção é um limite de frase de verdade, não uma suposição.
     duracao_pausa_s = config.get('duracao_pausa_frases_ms', 1000) / 1000
     if duracao_pausa_s > 0 and len(clips_audio) > 1:
-        silencio = AudioClip(lambda t: 0 * t, duration=duracao_pausa_s, fps=44100)
+        silencio = _silencio_audio(duracao_pausa_s)
         intercalados = []
         for i, c in enumerate(clips_audio):
             intercalados.append(c)
@@ -1701,7 +1721,7 @@ def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinh
         if i < len(clips_segmento) - 1:
             eh_apos_introducao = (i == 0)
             duracao_silencio = duracao_card_capitulo + (intro_duracao_vinheta if eh_apos_introducao else 0)
-            intercalados.append(AudioClip(lambda t: 0 * t, duration=duracao_silencio, fps=44100))
+            intercalados.append(_silencio_audio(duracao_silencio))
 
     audio_final = concatenate_audioclips(intercalados)
     audio_final.write_audiofile(audio_path, logger=None)

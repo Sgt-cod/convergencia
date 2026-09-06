@@ -19,6 +19,7 @@ from roteiro_engine import gerar_pacote_roteiro
 from producao_visual import (
     mapear_tempos_para_blocos,
     escolher_termos_por_bloco,
+    escolher_termos_especificos_por_bloco,
     escolher_palavras_destaque,
     resolver_destaques_com_tempo,
     construir_timeline_sfx,
@@ -84,7 +85,7 @@ SEGUNDOS_FADEOUT = float(os.environ.get('SEGUNDOS_FADEOUT', '2'))   # fade-out n
 DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '14'))  # dinamismo: nada fica mais que isso na tela
 # Teto de quanto tempo um print de notícia fica sozinho na tela — o resto do bloco
 # (se a narração daquele trecho for mais longa que isso) cai pro B-roll normal.
-
+DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
@@ -117,7 +118,6 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
-DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
 # pra clonar o canal em outro idioma, sem tocar no código.
 IDIOMA_CONTEUDO = config.get('idioma_conteudo', 'português do Brasil')
@@ -895,8 +895,10 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
         termo = bloco['termo']
         duracao_alvo = bloco['duracao']
         offset_bloco = bloco['inicio']
+        termo_especifico_ja_tentado = False  # só tenta 1x por bloco, não flooda o mesmo bloco de Wikimedia
 
-        print(f"  🎯 Bloco '{bloco['bloco']}' ({duracao_alvo:.1f}s) — termo: '{termo}'")
+        print(f"  🎯 Bloco '{bloco['bloco']}' ({duracao_alvo:.1f}s) — termo: '{termo}'"
+              + (f" (específico: '{bloco['termo_especifico']}')" if bloco.get('termo_especifico') else ""))
 
         # Webdoc, opt-in via config.json ('usar_prints_noticia': true): em vez de buscar
         # B-roll no Pexels pra esse bloco, gera um mockup de print de notícia (mockups_visuais.py)
@@ -937,15 +939,29 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                 print(f"   ✂️ MODO TESTE: limitado a {LIMITE_CLIPES_TESTE} clipe(s) no total")
                 return todos_os_clipes
 
-            # Diversidade de mídia (config 'pesos_fontes_midia'): antes de buscar mais
-            # vídeo no Pexels, sorteia se esse "slot" deveria vir de Wikimedia/Internet
-            # Archive/Agnes — sem isso configurado, sempre cai no Pexels normal (100%
-            # compatível com o comportamento antigo). Cada slot alternativo dura entre
-            # 10 e 14s (config 'duracao_slot_midia_alternativa_min/max') — dinamismo,
-            # sem ficar muito tempo parado numa imagem só.
+            # Diversidade de mídia: duas lógicas diferentes, não uma só.
+            # 1) Se o bloco tem uma ENTIDADE REAL específica (termo_especifico), busca
+            #    ela no Wikimedia/Internet Archive DE PROPÓSITO (não por sorteio) — é
+            #    "imagem relacionada" de verdade, não B-roll genérico. Só tenta 1x por
+            #    bloco (uma entidade específica não rende N imagens diferentes).
+            # 2) Caso contrário (ou se a busca específica não achar nada), cai pro
+            #    sorteio configurável de sempre ('pesos_fontes_midia') — sem isso
+            #    configurado, sempre Pexels (100% compatível com o comportamento antigo).
             caminho_alt, fonte_alt = None, None
             if duracao_alvo - tempo_coberto >= 3:  # não vale a pena buscar fonte alternativa pra um resto minúsculo
-                caminho_alt, fonte_alt = _escolher_fonte_midia_alternativa(termo)
+                termo_especifico = bloco.get('termo_especifico')
+                if termo_especifico and not termo_especifico_ja_tentado:
+                    termo_especifico_ja_tentado = True
+                    caminho_alt = buscar_imagem_wikimedia(termo_especifico)
+                    fonte_alt = 'wikimedia' if caminho_alt else None
+                    if not caminho_alt:
+                        caminho_alt = buscar_imagem_internet_archive(termo_especifico)
+                        fonte_alt = 'internet_archive' if caminho_alt else None
+
+                if not caminho_alt:
+                    caminho_alt, fonte_alt = _escolher_fonte_midia_alternativa(
+                        termo, termo_especifico=termo_especifico
+                    )
             if caminho_alt:
                 min_s = config.get('duracao_slot_midia_alternativa_min', 10)
                 max_s = config.get('duracao_slot_midia_alternativa_max', 14)
@@ -1202,13 +1218,20 @@ def buscar_imagem_internet_archive(termo, output_dir=None):
     return None
 
 
-def _escolher_fonte_midia_alternativa(termo):
+def _escolher_fonte_midia_alternativa(termo, termo_especifico=None):
     """
     Sorteia (com pesos configuráveis) se o próximo "slot" de B-roll de um bloco deve vir
     de uma fonte alternativa ao Pexels — Wikimedia Commons, Internet Archive ou Agnes AI
     (gerada). Retorna (caminho_arquivo, fonte) ou (None, None) se sorteou Pexels, se a
     fonte sorteada falhou, ou se nenhum peso > 0 estiver configurado. O chamador SEMPRE
     tem o Pexels como fallback — isso aqui só decide se tenta OUTRA coisa PRIMEIRO.
+
+    termo_especifico (opcional): nome de lugar/evento/órgão REAL extraído do bloco (ver
+    escolher_termos_especificos_por_bloco) — usado de PREFERÊNCIA ao termo genérico pro
+    Wikimedia/Internet Archive, porque essas fontes precisam de uma entidade real pra
+    achar algo relevante (termo genérico tipo "brazilian city aerial" não acha "imagem
+    relacionada" nenhuma lá, só serve pro Pexels). Sem termo_especifico, cai pro termo
+    genérico mesmo — pior busca, mas não quebra nada.
 
     Pesos em config.json → 'pesos_fontes_midia': {"pexels": 0.5, "wikimedia": 0.2,
     "internet_archive": 0.15, "agnes": 0.15}. Sem essa chave, o padrão é 100% Pexels
@@ -1224,14 +1247,14 @@ def _escolher_fonte_midia_alternativa(termo):
     if escolhida == 'pexels':
         return None, None
     if escolhida == 'wikimedia':
-        caminho = buscar_imagem_wikimedia(termo)
+        caminho = buscar_imagem_wikimedia(termo_especifico or termo)
         return (caminho, 'wikimedia') if caminho else (None, None)
     if escolhida == 'internet_archive':
-        caminho = buscar_imagem_internet_archive(termo)
+        caminho = buscar_imagem_internet_archive(termo_especifico or termo)
         return (caminho, 'internet_archive') if caminho else (None, None)
     if escolhida == 'agnes':
         caminho, e_video = gerar_midia_agnes(
-            termo, f"{ASSETS_DIR}/agnes",
+            termo_especifico or termo, f"{ASSETS_DIR}/agnes",
             tentar_video=config.get('agnes_gerar_video', False)
         )
         if not caminho:
@@ -2397,6 +2420,13 @@ def main():
 
     audio_path = f'{ASSETS_DIR}/audio.mp3'
     eh_webdoc_capitulos = (pacote_roteiro.get('modo') == 'capitulos_webdoc')
+    print(f"🧭 Modo de roteiro resultante: '{pacote_roteiro.get('modo')}' "
+          f"({'vinheta após abertura, cards por capítulo' if eh_webdoc_capitulos else 'vinheta no início, sem cards'})")
+    if config.get('modo_roteiro') == 'capitulos_webdoc' and not eh_webdoc_capitulos:
+        print("  ⚠️ ATENÇÃO: config.json pede 'capitulos_webdoc' mas o roteiro caiu no modo de "
+              "EMERGÊNCIA (fallback_simples) — a cadeia de capítulos falhou em algum estágio "
+              "(veja o traceback impresso mais acima). Por isso a vinheta saiu no início: sem "
+              "capitulos_meta, o pipeline usa a montagem antiga.")
 
     if eh_webdoc_capitulos:
         # Modo capítulos: cada segmento (introdução/capítulo/desfecho) é gerado como
@@ -2447,6 +2477,16 @@ def main():
         termos_por_bloco = escolher_termos_por_bloco(tema, blocos_com_tempo, termos_validados, _gemini_generate)
         for bloco, termo_bloco in zip(blocos_com_tempo, termos_por_bloco):
             bloco['termo'] = termo_bloco
+
+        # Termo ESPECÍFICO (nome de lugar/evento/órgão real) só pra Wikimedia/Internet
+        # Archive — o termo genérico acima é ótimo pro Pexels, mas quase nunca acha nada
+        # relevante no Wikimedia (que precisa de entidade real, não descrição de banco
+        # de imagem). Só roda se alguma fonte alternativa estiver configurada, pra não
+        # gastar uma chamada de Gemini à toa quando o canal usa só Pexels (padrão).
+        if any(k != 'pexels' for k in config.get('pesos_fontes_midia', {'pexels': 1.0})):
+            termos_especificos = escolher_termos_especificos_por_bloco(blocos_com_tempo, _gemini_generate)
+            for bloco, termo_esp in zip(blocos_com_tempo, termos_especificos):
+                bloco['termo_especifico'] = termo_esp
 
         # Webdoc, opt-in via config.json ('usar_prints_noticia': true) — inerte pro canal
         # atual, que não tem essa chave. Ver producao_visual.decidir_prints_de_noticia.

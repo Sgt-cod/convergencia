@@ -84,6 +84,7 @@ SEGUNDOS_FADEOUT = float(os.environ.get('SEGUNDOS_FADEOUT', '2'))   # fade-out n
 DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '14'))  # dinamismo: nada fica mais que isso na tela
 # Teto de quanto tempo um print de notícia fica sozinho na tela — o resto do bloco
 # (se a narração daquele trecho for mais longa que isso) cai pro B-roll normal.
+DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
@@ -116,8 +117,6 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
-
-DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
 # pra clonar o canal em outro idioma, sem tocar no código.
 IDIOMA_CONTEUDO = config.get('idioma_conteudo', 'português do Brasil')
@@ -385,7 +384,26 @@ def criar_audio_fishaudio(texto, output_file):
 
     print("  🔗 Concatenando trechos em áudio final...")
     clips_audio = [AudioFileClip(p) for p in caminhos_trechos]
-    audio_final = concatenate_audioclips(clips_audio)
+
+    # BUGFIX (pausa cortando palavra no meio): a versão anterior detectava silêncio no
+    # áudio JÁ CONCATENADO por amplitude (pydub) — uma consoante breve ou respiração no
+    # MEIO de uma palavra podia parecer silêncio e a pausa entrava ali, cortando a
+    # palavra. Aqui cada FRASE já é um arquivo separado (por causa da divisão acima) —
+    # então o silêncio entra exatamente na junção entre arquivos, nunca no meio de uma
+    # palavra, porque essa junção é um limite de frase de verdade, não uma suposição.
+    duracao_pausa_s = config.get('duracao_pausa_frases_ms', 1000) / 1000
+    if duracao_pausa_s > 0 and len(clips_audio) > 1:
+        silencio = AudioClip(lambda t: 0 * t, duration=duracao_pausa_s, fps=44100)
+        intercalados = []
+        for i, c in enumerate(clips_audio):
+            intercalados.append(c)
+            if i < len(clips_audio) - 1:
+                intercalados.append(silencio)
+        audio_final = concatenate_audioclips(intercalados)
+        print(f"  ✅ {len(clips_audio) - 1} pausa(s) entre frases de {duracao_pausa_s:.1f}s inserida(s)")
+    else:
+        audio_final = concatenate_audioclips(clips_audio)
+
     audio_final.write_audiofile(output_file, logger=None)
     for c in clips_audio:
         c.close()
@@ -439,67 +457,6 @@ def criar_audio(texto, output_file):
         print("⚠️ gTTS usado (último recurso)")
 
     return output_file
-
-
-def inserir_pausas_entre_frases(audio_path, duracao_pausa_ms=1000,
-                                 limiar_silencio_db=-38, duracao_min_deteccao_ms=120):
-    """
-    Pós-processa o áudio JÁ GERADO pra alongar as pausas naturais entre frases —
-    sem precisar de nenhuma chamada extra de TTS por frase (o que custaria muito mais
-    tempo/API em roteiros longos). A TTS já deixa um silêncio curto (rápido, ~150-400ms)
-    em toda vírgula/ponto; aqui a gente DETECTA esses silêncios (pydub) e estica os que
-    forem curtos até 'duracao_pausa_ms' — sem mexer em nada do trecho que tem fala real.
-
-    Roda ANTES da transcrição do Whisper (que é o "relógio mestre" de todo o resto do
-    pipeline — B-roll, legenda, destaque, SFX) — então todo o resto do sistema já
-    enxerga os timestamps certos, incluindo as pausas maiores, sem precisar de nenhum
-    ajuste em cascata em blocos_com_tempo/mapear_tempos_para_blocos.
-
-    Limitação honesta: como isso trabalha só em cima do ÁUDIO (não sabe onde estão as
-    vírgulas/pontos no TEXTO), qualquer silêncio detectado é esticado — geralmente bate
-    com pontuação real (é aonde a TTS naturalmente pausa), mas uma respiração natural
-    no meio de uma frase mais longa também pode ocasionalmente ser esticada. Isso é uma
-    troca aceitável: dá pra ajustar 'limiar_silencio_db'/'duracao_min_deteccao_ms' se
-    aparecer pausa demais ou de menos, tudo via config.json.
-    """
-    from pydub import AudioSegment
-    from pydub.silence import detect_silence
-
-    try:
-        audio = AudioSegment.from_file(audio_path)
-    except Exception as e:
-        print(f"  ⚠️ Não consegui abrir o áudio pra inserir pausas ({e}) — seguindo sem esse ajuste")
-        return audio_path
-
-    silencios = detect_silence(audio, min_silence_len=duracao_min_deteccao_ms,
-                                silence_thresh=limiar_silencio_db)
-    if not silencios:
-        print("  ℹ️ Nenhuma pausa natural detectada pra alongar — áudio segue como está")
-        return audio_path
-
-    pedacos = []
-    cursor = 0
-    pausas_esticadas = 0
-    for inicio_sil, fim_sil in silencios:
-        pedacos.append(audio[cursor:inicio_sil])  # trecho de fala real antes da pausa, intocado
-        duracao_original = fim_sil - inicio_sil
-        if duracao_original < duracao_pausa_ms:
-            pedacos.append(AudioSegment.silent(duration=duracao_pausa_ms, frame_rate=audio.frame_rate))
-            pausas_esticadas += 1
-        else:
-            pedacos.append(audio[inicio_sil:fim_sil])  # já era uma pausa longa — não mexe
-        cursor = fim_sil
-    pedacos.append(audio[cursor:])  # trecho final de fala depois da última pausa
-
-    audio_final = sum(pedacos[1:], pedacos[0])
-    audio_final.export(audio_path, format=os.path.splitext(audio_path)[1].lstrip('.') or 'mp3')
-
-    duracao_extra = pausas_esticadas * duracao_pausa_ms / 1000 - sum(
-        (fim - ini) / 1000 for ini, fim in silencios if (fim - ini) < duracao_pausa_ms
-    )
-    print(f"  ✅ {pausas_esticadas} pausa(s) entre frases alongada(s) para ~{duracao_pausa_ms / 1000:.1f}s "
-          f"(+{duracao_extra:.1f}s de narração no total)")
-    return audio_path
 
 
 # ============================================================
@@ -963,7 +920,7 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                     'path': caminho_print,
                     'inicio': offset_bloco,
                     'duracao': duracao_print,
-                    'transicao_bloco': True,
+                    'transicao_bloco': not bloco.get('inicio_capitulo'),
                 })
                 print(f"    📰 Print de notícia gerado ({duracao_print:.1f}s): \"{bloco['manchete_noticia']}\"")
                 tempo_coberto = duracao_print  # o resto do bloco (se sobrar) vira B-roll normal abaixo
@@ -996,7 +953,7 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                     'path': caminho_alt,
                     'inicio': offset_bloco + tempo_coberto,
                     'duracao': duracao_slot,
-                    'transicao_bloco': (tempo_coberto == 0.0),
+                    'transicao_bloco': (tempo_coberto == 0.0) and not bloco.get('inicio_capitulo'),
                     'fonte': fonte_alt,
                 })
                 tempo_coberto += duracao_slot
@@ -1054,7 +1011,11 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                     'path': destino,
                     'inicio': offset_bloco + tempo_coberto,
                     'duracao': duracao_uso,
-                    'transicao_bloco': (tempo_coberto == 0.0),  # 1º clipe do bloco → leva transição
+                    # 1º clipe do bloco leva transição (crossfade) — EXCETO quando o
+                    # bloco abre um capítulo (modo webdoc): ali a troca já é coberta
+                    # pelo card preto + vinheta silenciosos, um crossfade "vazaria"
+                    # B-roll pra dentro do silêncio antes do card acabar.
+                    'transicao_bloco': (tempo_coberto == 0.0) and not bloco.get('inicio_capitulo'),
                 })
                 tempo_coberto += duracao_uso
                 _salvar_pexels_usado(video_id)
@@ -1576,16 +1537,14 @@ def criar_video_curto(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
 
 def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_narracao,
-                       clips_legenda=None, clips_destaque=None, eventos_sfx=None,
-                       blocos_com_tempo=None):
-    """Horizontal (long), com intro fixa de assets/intro/ antes do bloco lead-in/narração/tail.
+                       clips_legenda=None, clips_destaque=None, eventos_sfx=None):
+    """Horizontal (long), com intro fixa de assets/intro/ ANTES do bloco lead-in/narração/tail.
 
-    blocos_com_tempo: opcional — só usado pro modo webdoc em capítulos (roteiro_engine.py
-    modo_roteiro='capitulos_webdoc'). Se algum bloco tiver 'inicio_capitulo': True, insere
-    um card preto com o título do capítulo (gerar_card_capitulo) no timestamp de início
-    daquele bloco, e troca a música de fundo por capítulo (_mixar_musica_por_capitulo) em
-    vez de uma faixa única pro vídeo inteiro. Sem isso (None, ou nenhum bloco marcado),
-    o vídeo sai exatamente como antes — feature 100% opt-in, não muda o modo padrão.
+    Usado pelos modos 'cadeia_completa'/'simples'. O modo 'capitulos_webdoc' usa
+    criar_video_webdoc_capitulos() em vez desta função — a estrutura de posicionamento
+    da vinheta e dos cards de capítulo é bem diferente (vinheta DEPOIS de uma abertura
+    sem vinheta, cards em silêncio real) pra valer a pena forçar as duas dentro da
+    mesma função.
     """
     print("📹 Criando vídeo longo (Pexels + intro)...")
     clips_legenda = clips_legenda or []
@@ -1648,22 +1607,7 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     offset_narracao = intro_duracao + SEGUNDOS_LEAD_IN
 
-    # Cards de capítulo (modo webdoc) — inseridos DEPOIS de clips_video na lista pra
-    # renderizar POR CIMA do B-roll (ocultando ele por trás do card durante a transição),
-    # exatamente no timestamp em que o narrador começa a falar aquele título.
-    cards_capitulo = []
-    marcos_capitulos_final = []
-    if blocos_com_tempo:
-        for b in blocos_com_tempo:
-            if b.get('inicio_capitulo') and b.get('titulo_capitulo'):
-                inicio_final = b['inicio'] + offset_narracao
-                marcos_capitulos_final.append(inicio_final)
-                card = gerar_card_capitulo(b['titulo_capitulo'], 1920, 1080).set_start(inicio_final)
-                cards_capitulo.append(card)
-        if cards_capitulo:
-            print(f"  📑 {len(cards_capitulo)} card(s) de capítulo inserido(s)")
-
-    todos_os_clips = ([intro_clip] if intro_clip else []) + clips_video + cards_capitulo + clips_legenda + clips_destaque
+    todos_os_clips = ([intro_clip] if intro_clip else []) + clips_video + clips_legenda + clips_destaque
     if not todos_os_clips:
         return None
 
@@ -1672,7 +1616,163 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     audio_narr = AudioFileClip(audio_path).set_start(offset_narracao)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=offset_narracao)
-    audio_final = _mixar_musica_por_capitulo(audio_com_sfx, duracao_total, marcos_capitulos_final, volume=0.06)
+    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=0.06)
+    audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
+
+    video_final = video_base.set_audio(audio_final)
+    video_final.write_videofile(output_file, fps=24, codec='libx264', audio_codec='aac',
+                                 preset='medium', bitrate='6000k', threads=4)
+
+    video_final.close()
+    audio_narr.close()
+    for c in todos_os_clips:
+        c.close()
+    return output_file
+
+
+def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta,
+                                   duracao_card_capitulo):
+    """
+    Gera o áudio do modo 'capitulos_webdoc' segmento por segmento (introdução, cada
+    capítulo, desfecho) — CADA UM como uma chamada de TTS separada — e concatena tudo
+    com SILÊNCIO REAL nos pontos de troca de capítulo, em vez de narração contínua:
+
+    - depois da introdução: silêncio = intro_duracao_vinheta + duracao_card_capitulo
+      (tempo pra vinheta tocar inteira + o card do capítulo 1 aparecer, os dois SEM
+      narração por cima)
+    - antes de cada capítulo seguinte (2, 3, ...) e antes do desfecho, se tiver título
+      de capítulo: silêncio = duracao_card_capitulo (só o card, vinheta não repete)
+
+    É esse silêncio de verdade no ÁUDIO — não um efeito visual sobreposto — que garante
+    o card não ser narrado: durante o card, literalmente não há fala nenhuma gravada.
+
+    Retorna audio_path (mesmo arquivo, sobrescrito com o áudio final concatenado).
+    """
+    segmentos = []
+    atual = []
+    for b in blocos_roteiro:
+        if b.get('inicio_capitulo') and atual:
+            segmentos.append(atual)
+            atual = []
+        atual.append(b)
+    if atual:
+        segmentos.append(atual)
+
+    pasta = f'{ASSETS_DIR}/audio_segmentos'
+    os.makedirs(pasta, exist_ok=True)
+
+    print(f"  🎬 Gerando áudio em {len(segmentos)} segmento(s) (introdução/capítulos/desfecho)...")
+    clips_segmento = []
+    for i, grupo in enumerate(segmentos):
+        texto_segmento = " ".join(aplicar_correcoes_pronuncia(b['texto']) for b in grupo)
+        caminho_segmento = f'{pasta}/segmento_{i:02d}.mp3'
+        print(f"    Segmento {i + 1}/{len(segmentos)} ({grupo[0]['bloco']})...")
+        criar_audio(texto_segmento, caminho_segmento)
+        clips_segmento.append(AudioFileClip(caminho_segmento))
+
+    intercalados = []
+    for i, clip in enumerate(clips_segmento):
+        intercalados.append(clip)
+        if i < len(clips_segmento) - 1:
+            eh_apos_introducao = (i == 0)
+            duracao_silencio = duracao_card_capitulo + (intro_duracao_vinheta if eh_apos_introducao else 0)
+            intercalados.append(AudioClip(lambda t: 0 * t, duration=duracao_silencio, fps=44100))
+
+    audio_final = concatenate_audioclips(intercalados)
+    audio_final.write_audiofile(audio_path, logger=None)
+    for c in clips_segmento:
+        c.close()
+    audio_final.close()
+
+    print(f"  ✅ Áudio final montado: {AudioFileClip(audio_path).duration:.1f}s "
+          f"(incluindo os silêncios de vinheta/card entre segmentos)")
+    return audio_path
+
+
+def criar_video_webdoc_capitulos(audio_path, blocos_com_tempo, lista_clipes, output_file,
+                                  duracao_narracao, clips_legenda=None, clips_destaque=None,
+                                  eventos_sfx=None):
+    """
+    Montagem do modo 'capitulos_webdoc': SEM vinheta no início — o vídeo já abre
+    falando/mostrando conteúdo (a "introdução", ~1min), termina em fade-to-black de 2s,
+    SÓ ENTÃO a vinheta do canal toca, seguida do card preto do capítulo 1 (mudo).
+    Cada capítulo depois disso termina em fade-to-black de 2s → card do próximo
+    capítulo (mudo) → capítulo seguinte — até o desfecho.
+
+    Pré-requisito: audio_path já foi montado por montar_audio_webdoc_capitulos(), então
+    duracao_narracao aqui já inclui os silêncios reais de vinheta/card — a duração
+    total do vídeo é exatamente duracao_narracao, sem nenhuma soma extra de intro.
+    """
+    print("📹 Criando vídeo webdoc em capítulos (abertura → vinheta → capítulos)...")
+    clips_legenda = clips_legenda or []
+    clips_destaque = clips_destaque or []
+
+    import glob
+    intros = glob.glob(f'{ASSETS_DIR}/intro/*.mp4') + glob.glob(f'{ASSETS_DIR}/intro/*.mov')
+    intro_clip_bruto, intro_duracao = None, 0.0
+    if intros:
+        intro_path = random.choice(intros) if len(intros) > 1 else intros[0]
+        print(f"  🎬 Vinheta (após a abertura): {os.path.basename(intro_path)}")
+        intro_clip_bruto = VideoFileClip(intro_path).resize(height=1080)
+        if intro_clip_bruto.w > 1920:
+            intro_clip_bruto = intro_clip_bruto.crop(x_center=intro_clip_bruto.w / 2, width=1920, height=1080)
+        elif intro_clip_bruto.w < 1920:
+            intro_clip_bruto = intro_clip_bruto.resize(width=1920)
+        if intro_clip_bruto.size != (1920, 1080):
+            intro_clip_bruto = intro_clip_bruto.resize((1920, 1080))
+        intro_clip_bruto = intro_clip_bruto.without_audio()
+        intro_duracao = intro_clip_bruto.duration
+    else:
+        print("  ℹ️ Nenhuma vinheta encontrada em assets/intro/ — seguindo sem vinheta")
+
+    clips_video = _montar_clips_pexels(lista_clipes, 1920, 1080)
+    # Aqui NÃO somamos intro_duracao/SEGUNDOS_LEAD_IN como em criar_video_longo — os
+    # timestamps de blocos_com_tempo (e portanto de lista_clipes, clips_legenda,
+    # clips_destaque, eventos_sfx) já são o tempo FINAL de verdade, porque o áudio foi
+    # montado com os silêncios de vinheta/card já embutidos (ver
+    # montar_audio_webdoc_capitulos) — o Whisper transcreveu esse áudio final, não um
+    # áudio "cru" que precisasse de deslocamento depois.
+    duracao_fade = 2.0
+    duracao_card = float(config.get('duracao_card_capitulo', 2.2))
+
+    overlays = []
+    for idx in range(len(blocos_com_tempo) - 1):
+        b_atual = blocos_com_tempo[idx]
+        b_prox = blocos_com_tempo[idx + 1]
+        if not b_prox.get('inicio_capitulo'):
+            continue  # troca comum de mídia dentro do mesmo capítulo — sem card, sem fade especial
+
+        eh_antes_do_capitulo_1 = (idx == 0)
+        fim_conteudo = b_atual['fim']
+
+        preto = ColorClip((1920, 1080), color=(0, 0, 0), duration=duracao_fade)
+        preto = preto.fadein(duracao_fade).set_start(max(0, fim_conteudo - duracao_fade))
+        overlays.append(preto)
+
+        cursor = fim_conteudo
+        if eh_antes_do_capitulo_1 and intro_clip_bruto:
+            overlays.append(intro_clip_bruto.set_start(cursor))
+            cursor += intro_duracao
+
+        card = gerar_card_capitulo(b_prox.get('titulo_capitulo', ''), 1920, 1080, duracao=duracao_card)
+        overlays.append(card.set_start(cursor))
+
+    n_capitulos = len([b for b in blocos_com_tempo if b.get('inicio_capitulo')])
+    if overlays:
+        print(f"  📑 {n_capitulos} card(s) de capítulo + vinheta + fade-to-black inseridos")
+
+    marcos_capitulos = [b['inicio'] for b in blocos_com_tempo if b.get('inicio_capitulo')]
+
+    todos_os_clips = clips_video + overlays + clips_legenda + clips_destaque
+    if not todos_os_clips:
+        return None
+
+    video_base = CompositeVideoClip(todos_os_clips, size=(1920, 1080)).set_duration(duracao_narracao)
+    video_base = video_base.fadeout(SEGUNDOS_FADEOUT)
+
+    audio_narr = AudioFileClip(audio_path)
+    audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=0.0)
+    audio_final = _mixar_musica_por_capitulo(audio_com_sfx, duracao_narracao, marcos_capitulos, volume=0.06)
     audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
 
     video_final = video_base.set_audio(audio_final)
@@ -2294,16 +2394,31 @@ def main():
     # e o roteiro já passa por _extrair_json, que falharia com texto muito malformado.
 
     audio_path = f'{ASSETS_DIR}/audio.mp3'
-    texto_falado = aplicar_correcoes_pronuncia(roteiro)
-    criar_audio(texto_falado, audio_path)
+    eh_webdoc_capitulos = (pacote_roteiro.get('modo') == 'capitulos_webdoc')
 
-    # Narração "atropelada" (frases coladas uma na outra): alonga as pausas naturais
-    # entre frases pra ~1s (config 'duracao_pausa_frases_ms', default 1000 — 0 desativa).
-    # Roda ANTES da transcrição, então todo o resto do pipeline (B-roll, legenda,
-    # destaque, SFX) já enxerga os timestamps certos automaticamente.
-    duracao_pausa_ms = config.get('duracao_pausa_frases_ms', 1000)
-    if duracao_pausa_ms > 0:
-        inserir_pausas_entre_frases(audio_path, duracao_pausa_ms=duracao_pausa_ms)
+    if eh_webdoc_capitulos:
+        # Modo capítulos: cada segmento (introdução/capítulo/desfecho) é gerado como
+        # áudio SEPARADO e concatenado com SILÊNCIO REAL nos pontos de troca de
+        # capítulo — é isso que garante o card de transição não ser narrado (ver
+        # docstring de montar_audio_webdoc_capitulos). intro_duracao_vinheta precisa
+        # ser conhecida ANTES de montar o áudio, pra reservar o silêncio certo.
+        import glob
+        intros_probe = glob.glob(f'{ASSETS_DIR}/intro/*.mp4') + glob.glob(f'{ASSETS_DIR}/intro/*.mov')
+        intro_duracao_vinheta = 0.0
+        if intros_probe:
+            _clip_probe = VideoFileClip(intros_probe[0])
+            intro_duracao_vinheta = _clip_probe.duration
+            _clip_probe.close()
+        duracao_card_capitulo = float(config.get('duracao_card_capitulo', 2.2))
+
+        montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta,
+                                       duracao_card_capitulo)
+    else:
+        texto_falado = aplicar_correcoes_pronuncia(roteiro)
+        # A pausa entre frases (config 'duracao_pausa_frases_ms') agora é aplicada DENTRO
+        # de criar_audio_fishaudio, entre os arquivos de frase já separados — não como
+        # pós-processamento cego em cima do áudio pronto (ver bugfix no próprio arquivo).
+        criar_audio(texto_falado, audio_path)
 
     audio_clip = AudioFileClip(audio_path)
     duracao_narracao = audio_clip.duration
@@ -2383,10 +2498,14 @@ def main():
             resultado = criar_video_curto(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
                                            clips_legenda=clips_legenda, clips_destaque=clips_destaque,
                                            eventos_sfx=eventos_sfx)
+        elif eh_webdoc_capitulos:
+            resultado = criar_video_webdoc_capitulos(audio_path, blocos_com_tempo, lista_clipes, video_path,
+                                                       duracao_narracao, clips_legenda=clips_legenda,
+                                                       clips_destaque=clips_destaque, eventos_sfx=eventos_sfx)
         else:
             resultado = criar_video_longo(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
                                            clips_legenda=clips_legenda, clips_destaque=clips_destaque,
-                                           eventos_sfx=eventos_sfx, blocos_com_tempo=blocos_com_tempo)
+                                           eventos_sfx=eventos_sfx)
 
         if not resultado:
             print("❌ Erro ao criar vídeo")

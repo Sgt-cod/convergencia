@@ -153,11 +153,18 @@ def decidir_prints_de_noticia(blocos_com_tempo, gemini_generate_fn, usar_prints_
         f"[{i}] ({b['bloco']}): {b['texto']}" for i, b in enumerate(blocos_com_tempo)
     )
 
-    prompt = f"""Analise os blocos de um roteiro de vídeo abaixo e identifique SÓ os blocos
-que descrevem um fato, evento ou dado que faria sentido ilustrar com um "print de
-notícia" (uma manchete de jornal genérica) — não use isso pra blocos de abertura,
-reflexão pessoal, opinião ou fechamento, só pra fatos/eventos concretos. Seja seletivo:
-no máximo 1 a cada 3 blocos deve receber isso, a maioria dos vídeos não deve ter nenhum.
+    prompt = f"""Analise os blocos de um roteiro de vídeo abaixo e identifique os blocos que
+descrevem um fato, evento ou dado que faria sentido ilustrar com um "print de notícia"
+(uma manchete de jornal genérica) — não use isso pra blocos de abertura, reflexão
+pessoal, opinião ou fechamento, só pra fatos/eventos concretos.
+
+IMPORTANTE: cada bloco abaixo pode ser um CAPÍTULO INTEIRO (várias centenas de
+palavras, cobrindo vários fatos diferentes dentro do mesmo tema) — não é uma frase
+curta. Nesse caso, seja generoso: se o capítulo tem 2-3 fatos/dados concretos
+citáveis, ESCOLHA-O (você vai apontar qual É a manchete mais forte dali, só uma por
+bloco — não precisa esgotar o bloco). Prefira errar pra mais do que pra menos: um
+webdoc investigativo tem tipicamente um print de notícia POR CAPÍTULO quando o
+capítulo trata de um fato concreto, não é exceção rara.
 
 BLOCOS:
 {blocos_prompt}
@@ -168,7 +175,7 @@ inventar fatos novos.
 
 Retorne APENAS JSON:
 {{"escolhidos": [{{"indice": 0, "manchete": "...", "subtitulo": "..."}}]}}
-Se nenhum bloco se encaixar, retorne {{"escolhidos": []}}."""
+Se nenhum bloco se encaixar (ex: todos são só reflexão/opinião), retorne {{"escolhidos": []}}."""
 
     try:
         resposta = gemini_generate_fn(prompt)

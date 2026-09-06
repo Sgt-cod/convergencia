@@ -39,6 +39,59 @@ quebrar o pipeline — mesma filosofia de fallback que já existe no resto do c�
 import json
 import re
 
+# Segunda camada de defesa contra o roteiro "vazar" direção de produção pro que vira
+# fala (ex: um documento_estilo em formato de roteiro profissional, com timecode e
+# indicação de trilha/efeito sonoro, sendo copiado literalmente pelo Gemini em vez de
+# só inspirar o tom). Mesmo com a instrução reforçada no prompt de gerar_prosa, isso
+# roda em CIMA do texto já gerado, pra nunca depender só do modelo "obedecer bem".
+_PADROES_DIRECAO_PRODUCAO = [
+    re.compile(r'^\s*\d{1,2}:\d{2}(:\d{2})?\s*[-–—]?\s*', re.IGNORECASE),  # "00:00 - " no início da frase
+    re.compile(r'\bzero\s+hora[s]?\b', re.IGNORECASE),                     # "zero hora(s)" (timecode por extenso)
+    re.compile(r'^\s*(LOCUTOR|NARRADOR|VOZ|APRESENTADOR)\s*:\s*', re.IGNORECASE),  # rótulo de quem fala
+    re.compile(r'\[[^\]]*\]'),                                             # qualquer coisa entre colchetes
+    re.compile(
+        r'\((?:[^()]*\b(?:sfx|trilha|efeito sonoro|som de|transição|corte para|fade)\b[^()]*)\)',
+        re.IGNORECASE
+    ),  # parênteses com palavra-chave de direção de produção dentro
+]
+
+# Contaminação em PROSA LIVRE (sem colchete/rótulo/parêntese) não dá pra pegar por
+# trecho isolado — é a FRASE INTEIRA que é direção de produção (ex: "trilha sonora de
+# abertura, um pulso grave, eletrônico, minimalista..."), não uma palavra solta no meio
+# de uma frase legítima. Por isso aqui o filtro descarta a SENTENÇA INTEIRA quando ela
+# acumula 2+ termos dessa lista — uma sentença real sobre o TEMA do vídeo dificilmente
+# bate em 2 desses termos ao mesmo tempo, então o risco de falso positivo é baixo.
+_TERMOS_PRODUCAO = [
+    'trilha sonora', 'efeito sonoro', 'som ambiente', 'som de clique', 'som de mouse',
+    'locutor', 'narrador', 'apresentador', 'sfx', 'fade in', 'fade out', 'corte para',
+    'transição de', 'transição x', 'pulso grave', 'nota de piano', 'notas de piano',
+    'zero hora', 'tom direto, objetivo', 'sem firulas emocionais',
+]
+
+
+def _sentenca_e_direcao_producao(sentenca):
+    sentenca_lower = sentenca.lower()
+    acertos = sum(1 for termo in _TERMOS_PRODUCAO if termo in sentenca_lower)
+    return acertos >= 2
+
+
+def sanitizar_direcoes_de_producao(texto):
+    """
+    Remove qualquer resquício de direção de produção que porventura tenha passado pelo
+    prompt (ver aviso em gerar_prosa) — timecode/trilha/efeito sonoro em trecho isolado
+    (colchete, parêntese, rótulo) E sentenças inteiras em prosa livre que claramente
+    descrevem produção de áudio/vídeo em vez de conteúdo do tema. Aplicado em TODO
+    texto de bloco antes de virar narração, em qualquer modo.
+    """
+    for padrao in _PADROES_DIRECAO_PRODUCAO:
+        texto = padrao.sub('', texto)
+
+    sentencas = re.split(r'(?<=[.!?])\s+', texto)
+    sentencas_limpas = [s for s in sentencas if not _sentenca_e_direcao_producao(s)]
+    texto = " ".join(sentencas_limpas)
+
+    return re.sub(r'\s{2,}', ' ', texto).strip()
+
 
 def _extrair_json(texto):
     """Mesmo padrão já usado em gerar_titulo() no generate_video.py: acha o primeiro { ... }."""
@@ -128,7 +181,15 @@ def gerar_prosa(estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
 DOCUMENTO DE ESTILO — use isso como referência de TOM E VOZ (vocabulário, cadência,
 tipo de imagem usada), NÃO como referência de TAMANHO. Os exemplos abaixo podem ser
 mais curtos que a meta de palavras pedida mais adiante — nesse caso, desenvolva mais
-os mesmos pontos na mesma voz, em vez de encurtar pra bater com o tamanho do exemplo:
+os mesmos pontos na mesma voz, em vez de encurtar pra bater com o tamanho do exemplo.
+
+ATENÇÃO: se o documento de estilo tiver vindo de um roteiro de produção profissional,
+ele pode conter timecode (ex: "00:00", "01:23"), indicação de trilha sonora/efeito
+sonoro (ex: "pulso grave eletrônico", "SFX: clique"), rótulo de quem fala (ex:
+"LOCUTOR:", "NARRADOR:") ou direção de cena/câmera. NADA disso é texto pra narrar —
+é metadado de produção, não fala. Extraia SÓ as palavras que uma pessoa diria em voz
+alta, e IGNORE completamente qualquer marcação técnica, mesmo que isso signifique
+reescrever o trecho do zero na mesma voz/tom:
 {exemplos}
 """
 
@@ -154,7 +215,13 @@ REGRAS OBRIGATÓRIAS:
   "prepare-se para descobrir", ou qualquer frase que serviria em vídeo sobre qualquer
   outro tema do mesmo nicho
 - Frases curtas, sem formatação, sem asteriscos, sem emojis
-- NÃO mencione apresentador, câmera ou elementos visuais{linha_extra}
+- NÃO mencione apresentador, câmera ou elementos visuais
+- PROIBIDO incluir QUALQUER marcação técnica de produção: timecode (nem por extenso,
+  tipo "zero hora"), indicação de trilha sonora, indicação de efeito sonoro (SFX),
+  nome de transição, rótulo de locutor/narrador, direção de cena. O texto de cada
+  bloco tem que ser 100% falável em voz alta do primeiro ao último caractere — se ao
+  reler um trecho ele soa como uma instrução PRA alguém produzir o vídeo, em vez de
+  uma frase QUE o narrador diria, ele não pode entrar no roteiro{linha_extra}
 
 Retorne APENAS JSON:
 {{
@@ -172,6 +239,7 @@ Retorne APENAS JSON:
         b['texto'] = re.sub(r'\*+', '', b['texto'])
         b['texto'] = b['texto'].replace('#', '').replace('_', '').strip()
         b['texto'] = padrao_prefixo.sub('', b['texto']).strip()
+        b['texto'] = sanitizar_direcoes_de_producao(b['texto'])
 
     total_palavras = sum(len(b['texto'].split()) for b in blocos)
     if total_palavras < palavras_alvo * 0.7:
@@ -514,7 +582,7 @@ Retorne APENAS JSON: {{"reescritas": [{{"indice": 0, "texto_novo": "..."}}]}}"""
         i = r.get('indice')
         if isinstance(i, int) and 0 <= i < len(blocos) and r.get('texto_novo'):
             texto_novo = padrao_prefixo.sub('', r['texto_novo'].strip())
-            blocos[i]['texto'] = texto_novo.strip()
+            blocos[i]['texto'] = sanitizar_direcoes_de_producao(texto_novo.strip())
 
     return blocos
 

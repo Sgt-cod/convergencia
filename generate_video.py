@@ -84,7 +84,7 @@ SEGUNDOS_FADEOUT = float(os.environ.get('SEGUNDOS_FADEOUT', '2'))   # fade-out n
 DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '14'))  # dinamismo: nada fica mais que isso na tela
 # Teto de quanto tempo um print de notícia fica sozinho na tela — o resto do bloco
 # (se a narração daquele trecho for mais longa que isso) cai pro B-roll normal.
-
+DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
@@ -117,7 +117,6 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
-DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
 # pra clonar o canal em outro idioma, sem tocar no código.
 IDIOMA_CONTEUDO = config.get('idioma_conteudo', 'português do Brasil')
@@ -2383,6 +2382,7 @@ def main():
         gemini_generate_fn=_gemini_generate,
         modo_roteiro=config.get('modo_roteiro', 'cadeia_completa'),
         num_capitulos=config.get('num_capitulos_webdoc', 3),
+        palavras_alvo_webdoc=config.get('palavras_alvo_webdoc'),
     )
     roteiro = pacote_roteiro['roteiro_texto']
     titulo_video = pacote_roteiro['titulo']
@@ -2465,7 +2465,12 @@ def main():
 
         largura_legenda = 1080 if VIDEO_TYPE == 'short' else 1920
         altura_legenda = 1920 if VIDEO_TYPE == 'short' else 1080
-        offset_legenda = SEGUNDOS_LEAD_IN  # NÃO inclui intro — quem soma intro_duracao é criar_video_longo
+        # No modo webdoc em capítulos, blocos_com_tempo/lista_clipes/audio_path já usam
+        # tempo "puro" (0 = início real da narração, sem vinheta antes) — ver
+        # criar_video_webdoc_capitulos, que não soma nenhum offset por conta própria.
+        # Nos outros modos, SEGUNDOS_LEAD_IN é o espaço de vídeo+música ANTES da
+        # narração começar (e quem soma intro_duracao em cima é criar_video_longo).
+        offset_legenda = 0.0 if eh_webdoc_capitulos else SEGUNDOS_LEAD_IN
         # Formato webdoc costuma preferir só a palavra de destaque na tela, sem legenda
         # corrida por baixo (visual mais limpo, menos "poluído") — config.json →
         # 'usar_legenda': false. Destaque continua sempre ativo (não tem toggle próprio

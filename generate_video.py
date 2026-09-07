@@ -123,7 +123,7 @@ DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
 # pra clonar o canal em outro idioma, sem tocar no código.
 IDIOMA_CONTEUDO = config.get('idioma_conteudo', 'português do Brasil')
-CONTEXTO_NICHO = config.get('contexto_nicho', 'reflexão cristã/motivacional')
+CONTEXTO_NICHO = config.get('contexto_nicho', 'documentário investigativo de dados')
 INSTRUCAO_EXTRA_ROTEIRO = config.get('instrucao_extra_roteiro', '')
 
 # Fonte da legenda: nome da família (como o ImageMagick/fontconfig reconhece após instalado
@@ -1676,21 +1676,39 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
     return output_file
 
 
-def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta,
-                                   duracao_card_capitulo):
+def _duracao_silencio_transicao(eh_apos_introducao, intro_duracao_vinheta):
+    """
+    Duração TOTAL de silêncio entre o fim da fala de um segmento e o início da fala do
+    próximo, no modo webdoc em capítulos. Usada IDENTICAMENTE por
+    montar_audio_webdoc_capitulos (que reserva esse silêncio no ÁUDIO) e por
+    criar_video_webdoc_capitulos (que posiciona fade/vinheta/card dentro dele) — as
+    duas TÊM que concordar em milissegundos, por isso isso vive numa função só, nunca
+    duplicado.
+
+    Sequência dentro desse silêncio (todas config.json, com esses padrões):
+    1. duracao_fade_conteudo (2s): a mídia do capítulo anterior funde pro preto
+    2. duracao_gap_pre_titulo (2s): tela preta "respirando", nada acontece ainda
+    3. [SÓ depois da introdução] intro_duracao_vinheta: a vinheta do canal toca inteira
+    4. duracao_card_capitulo (7s): o título do próximo capítulo, em branco, tela preta
+    """
+    fade = float(config.get('duracao_fade_conteudo', 2.0))
+    gap = float(config.get('duracao_gap_pre_titulo', 2.0))
+    card = float(config.get('duracao_card_capitulo', 7.0))
+    vinheta = intro_duracao_vinheta if eh_apos_introducao else 0.0
+    return fade + gap + vinheta + card
+
+
+def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta):
     """
     Gera o áudio do modo 'capitulos_webdoc' segmento por segmento (introdução, cada
     capítulo, desfecho) — CADA UM como uma chamada de TTS separada — e concatena tudo
-    com SILÊNCIO REAL nos pontos de troca de capítulo, em vez de narração contínua:
-
-    - depois da introdução: silêncio = intro_duracao_vinheta + duracao_card_capitulo
-      (tempo pra vinheta tocar inteira + o card do capítulo 1 aparecer, os dois SEM
-      narração por cima)
-    - antes de cada capítulo seguinte (2, 3, ...) e antes do desfecho, se tiver título
-      de capítulo: silêncio = duracao_card_capitulo (só o card, vinheta não repete)
+    com SILÊNCIO REAL nos pontos de troca de capítulo (ver _duracao_silencio_transicao
+    pra sequência exata: fade da mídia → respiro preto → [vinheta, só após a intro] →
+    card do capítulo).
 
     É esse silêncio de verdade no ÁUDIO — não um efeito visual sobreposto — que garante
-    o card não ser narrado: durante o card, literalmente não há fala nenhuma gravada.
+    o narrador terminar de falar ANTES da tela ir pro preto, em vez de ficar cortado
+    ao meio como acontecia quando o corte dependia só da precisão do Whisper.
 
     Retorna audio_path (mesmo arquivo, sobrescrito com o áudio final concatenado).
     """
@@ -1721,7 +1739,7 @@ def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinh
         intercalados.append(clip)
         if i < len(clips_segmento) - 1:
             eh_apos_introducao = (i == 0)
-            duracao_silencio = duracao_card_capitulo + (intro_duracao_vinheta if eh_apos_introducao else 0)
+            duracao_silencio = _duracao_silencio_transicao(eh_apos_introducao, intro_duracao_vinheta)
             intercalados.append(_silencio_audio(duracao_silencio))
 
     audio_final = concatenate_audioclips(intercalados)
@@ -1731,7 +1749,7 @@ def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinh
     audio_final.close()
 
     print(f"  ✅ Áudio final montado: {AudioFileClip(audio_path).duration:.1f}s "
-          f"(incluindo os silêncios de vinheta/card entre segmentos)")
+          f"(incluindo os silêncios de fade/respiro/vinheta/card entre segmentos)")
     return audio_path
 
 
@@ -1775,11 +1793,12 @@ def criar_video_webdoc_capitulos(audio_path, blocos_com_tempo, lista_clipes, out
     # Aqui NÃO somamos intro_duracao/SEGUNDOS_LEAD_IN como em criar_video_longo — os
     # timestamps de blocos_com_tempo (e portanto de lista_clipes, clips_legenda,
     # clips_destaque, eventos_sfx) já são o tempo FINAL de verdade, porque o áudio foi
-    # montado com os silêncios de vinheta/card já embutidos (ver
-    # montar_audio_webdoc_capitulos) — o Whisper transcreveu esse áudio final, não um
-    # áudio "cru" que precisasse de deslocamento depois.
-    duracao_fade = 2.0
-    duracao_card = float(config.get('duracao_card_capitulo', 2.2))
+    # montado com os silêncios de fade/respiro/vinheta/card já embutidos (ver
+    # montar_audio_webdoc_capitulos/_duracao_silencio_transicao) — o Whisper transcreveu
+    # esse áudio final, não um áudio "cru" que precisasse de deslocamento depois.
+    duracao_fade = float(config.get('duracao_fade_conteudo', 2.0))
+    duracao_gap = float(config.get('duracao_gap_pre_titulo', 2.0))
+    duracao_card = float(config.get('duracao_card_capitulo', 7.0))
 
     overlays = []
     for idx in range(len(blocos_com_tempo) - 1):
@@ -1789,19 +1808,37 @@ def criar_video_webdoc_capitulos(audio_path, blocos_com_tempo, lista_clipes, out
             continue  # troca comum de mídia dentro do mesmo capítulo — sem card, sem fade especial
 
         eh_antes_do_capitulo_1 = (idx == 0)
-        fim_conteudo = b_atual['fim']
+        fim_conteudo = b_atual['fim']  # instante em que o narrador REALMENTE para de falar
 
+        # 1) a mídia funde pro preto DEPOIS que a fala já terminou — nunca durante,
+        #    porque agora existe silêncio real reservado no áudio pra isso (sem
+        #    depender da precisão do Whisper pra não cortar a última palavra)
         preto = ColorClip((1920, 1080), color=(0, 0, 0), duration=duracao_fade)
-        preto = preto.fadein(duracao_fade).set_start(max(0, fim_conteudo - duracao_fade))
+        preto = preto.fadein(duracao_fade).set_start(fim_conteudo)
         overlays.append(preto)
+        cursor = fim_conteudo + duracao_fade
 
-        cursor = fim_conteudo
+        # 2) "respiro" em tela preta, sem nada acontecendo ainda (o preto já está
+        #    sólido desde o fim do fade — não precisa de clipe nenhum aqui, só avançar
+        #    o cursor; o composite já mostra preto por padrão onde não há clipe)
+        cursor += duracao_gap
+
+        # 3) vinheta do canal — só na transição pro capítulo 1
         if eh_antes_do_capitulo_1 and intro_clip_bruto:
             overlays.append(intro_clip_bruto.set_start(cursor))
             cursor += intro_duracao
 
+        # 4) card do capítulo — a próxima fala só começa exatamente quando ele termina
         card = gerar_card_capitulo(b_prox.get('titulo_capitulo', ''), 1920, 1080, duracao=duracao_card)
         overlays.append(card.set_start(cursor))
+        cursor += duracao_card
+
+        # conferência: cursor tem que bater exato com b_prox['inicio'] — se não bater,
+        # é sinal de que _duracao_silencio_transicao (áudio) e este cálculo (vídeo)
+        # ficaram fora de sincronia (ver comentário na função compartilhada)
+        if abs(cursor - b_prox['inicio']) > 0.05:
+            print(f"    ⚠️ Encaixe de transição com {abs(cursor - b_prox['inicio']):.2f}s de folga "
+                  f"em '{b_prox['bloco']}' — confira _duracao_silencio_transicao")
 
     n_capitulos = len([b for b in blocos_com_tempo if b.get('inicio_capitulo')])
     if overlays:
@@ -2450,6 +2487,19 @@ def main():
               "(veja o traceback impresso mais acima). Por isso a vinheta saiu no início: sem "
               "capitulos_meta, o pipeline usa a montagem antiga.")
 
+    # BUGFIX (Wikimedia/Internet Archive nunca sendo tentados): antes, diversidade de
+    # mídia era 100% opt-in via 'pesos_fontes_midia' no config.json — mas isso é fácil
+    # de esquecer de configurar, e webdoc SEM diversidade de fonte foi reportado como
+    # problema real mais de uma vez. Agora, se o modo é 'capitulos_webdoc' e a chave não
+    # foi definida explicitamente, injeta um padrão sensato — só pra ESTE modo (o canal
+    # devocional/cadeia_completa continua 100% Pexels por padrão, comportamento antigo
+    # intocado). Definir 'pesos_fontes_midia' no config.json continua funcionando pra
+    # quem quiser um mix diferente.
+    if eh_webdoc_capitulos and 'pesos_fontes_midia' not in config:
+        config['pesos_fontes_midia'] = {'pexels': 0.55, 'wikimedia': 0.3, 'internet_archive': 0.1, 'agnes': 0.05}
+        print(f"  🌐 'pesos_fontes_midia' não configurado — usando padrão de diversidade "
+              f"pro modo webdoc: {config['pesos_fontes_midia']}")
+
     if eh_webdoc_capitulos:
         # Modo capítulos: cada segmento (introdução/capítulo/desfecho) é gerado como
         # áudio SEPARADO e concatenado com SILÊNCIO REAL nos pontos de troca de
@@ -2463,10 +2513,8 @@ def main():
             _clip_probe = VideoFileClip(intros_probe[0])
             intro_duracao_vinheta = _clip_probe.duration
             _clip_probe.close()
-        duracao_card_capitulo = float(config.get('duracao_card_capitulo', 2.2))
 
-        montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta,
-                                       duracao_card_capitulo)
+        montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta)
     else:
         texto_falado = aplicar_correcoes_pronuncia(roteiro)
         # A pausa entre frases (config 'duracao_pausa_frases_ms') agora é aplicada DENTRO

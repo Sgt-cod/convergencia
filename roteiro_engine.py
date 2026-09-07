@@ -307,32 +307,51 @@ def gerar_estrutura_capitulos(tema, contexto_nicho, idioma_conteudo, gemini_gene
     _mixar_musica_por_capitulo).
     """
     prompt = f"""Você é roteirista de documentário investigativo de dados (estilo canais
-como "Elementar" no YouTube — vídeos tipo "Por que X está assim?", "A fraude de Y",
-"O esquema de Z", sempre com dado oficial concreto por trás). NÃO escreva prosa ainda —
-apenas o esqueleto, em {idioma_conteudo}.
+como "Elementar" no YouTube). NÃO escreva prosa ainda — apenas o esqueleto, em {idioma_conteudo}.
 
 NICHO: {contexto_nicho}
 TEMA: "{tema}"
 
-Construa {num_capitulos} capítulos, cada um cobrindo uma FACETA DIFERENTE do tema —
-escolha os {num_capitulos} ângulos mais fortes especificamente pra ESTE tema (não uma
-lista genérica que serviria pra qualquer tema do nicho).
+A diferença entre um webdoc investigativo de verdade e um resumo genérico é esta: o
+webdoc ANCORA a explicação abstrata em UM CASO CONCRETO — data, número, nome de lugar
+ou instituição — e usa esse caso como fio condutor que atravessa o vídeo inteiro, não
+só a introdução. Exemplo do padrão esperado (tema: segurança contra incêndio em
+prédios): o vídeo NÃO abre dizendo "normas de segurança são importantes" — abre
+contando o incêndio do Edifício Joelma, São Paulo, 1º de fevereiro de 1974, 8h50, 187
+mortos de 756 pessoas — e cada capítulo depois volta a ESSE caso pra ilustrar um ponto
+diferente (por que não havia sprinkler, o que mudou depois, o que outro país fez
+diferente no mesmo período).
+
+Antes de montar os capítulos, IDENTIFIQUE um caso/evento/incidente específico e real
+(ou um dado concreto — uma cidade, empresa, lei com número, ano) que sirva de
+ANCORAGEM pro tema. Esse caso:
+- precisa ser plausível e checável — se você não tiver certeza absoluta de um número
+  exato, escreva o dado como o tipo de fato que existe e marque "[confirmar número
+  exato]" no lugar dele, em vez de inventar uma estatística falsa apresentada como certa
+- precisa reaparecer em pelo menos 2 dos {num_capitulos} capítulos, não só na introdução
+
+Construa {num_capitulos} capítulos, cada um cobrindo uma FACETA DIFERENTE do tema,
+todos conectados ao caso de ancoragem.
 
 Regras:
 - O título de cada capítulo tem 3 a 6 palavras, como um RÓTULO de seção de documentário
   — não é uma frase completa (ex: "A Fábrica de Prédios", não "Por que os prédios são
   construídos assim")
-- A introdução deve abrir com um DADO ou FATO concreto e específico sobre o tema, não
-  uma pergunta genérica
-- O desfecho deve responder à pergunta implícita do vídeo, não só resumir os capítulos
+- A introdução abre CONTANDO o caso de ancoragem como cena (data, hora, número), não
+  com uma afirmação genérica sobre o tema
+- Em "cobre", diga EXPLICITAMENTE que fato/número/nome específico aquele capítulo vai
+  usar como evidência — não só o ângulo abstrato (isso é instrução pra quem for
+  escrever a prosa depois não fugir pro genérico)
+- O desfecho responde à pergunta implícita do vídeo citando de novo o caso de ancoragem
 
 Retorne APENAS JSON:
 {{
-  "introducao": "o que a introdução deve cobrir — o dado forte de abertura + o tema",
+  "caso_ancoragem": "descrição do caso/evento específico escolhido, com os dados que você tem certeza + [confirmar] onde não tiver",
+  "introducao": "o que a introdução deve cobrir — o caso de ancoragem contado como cena + apresentação do tema",
   "capitulos": [
-    {{"titulo": "Título Curto do Capítulo 1", "cobre": "que faceta/ângulo este capítulo aborda, em detalhe suficiente pra escrever a prosa depois"}}
+    {{"titulo": "Título Curto do Capítulo 1", "cobre": "que faceta/ângulo este capítulo aborda + que fato/número específico usa como evidência"}}
   ],
-  "desfecho": "o que o desfecho deve responder/concluir"
+  "desfecho": "o que o desfecho deve responder/concluir, citando de novo o caso de ancoragem"
 }}
 (o array "capitulos" deve ter exatamente {num_capitulos} itens)"""
 
@@ -364,7 +383,25 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
         estrutura_prosa[f'capitulo_{i + 1}'] = cap['cobre']
     estrutura_prosa['desfecho'] = estrutura_capitulos['desfecho']
 
-    blocos = gerar_prosa(estrutura_prosa, contexto_nicho, idioma_conteudo, instrucao_extra,
+    # O caso de ancoragem (ver gerar_estrutura_capitulos) precisa estar visível na
+    # escrita de TODOS os capítulos, não só da introdução — senão cada capítulo é
+    # escrito "às cegas" quanto ao fio condutor do vídeo e a prosa volta a ficar
+    # genérica. gerar_prosa já manda TODOS os itens da estrutura numa prompt só (tem
+    # contexto de todos ao escrever cada um), então isso só precisa entrar como reforço
+    # explícito via instrucao_extra.
+    caso_ancoragem = estrutura_capitulos.get('caso_ancoragem', '')
+    reforco_densidade = (
+        f"CASO DE ANCORAGEM deste vídeo (mantenha ele presente em pelo menos 2 capítulos, "
+        f"não só na introdução): {caso_ancoragem}\n"
+        f"DENSIDADE DE INFORMAÇÃO: cada parágrafo precisa conter pelo menos UM fato "
+        f"específico (número, data, nome de lugar/pessoa/instituição/lei) — nunca uma "
+        f"frase que serviria pra qualquer vídeo genérico sobre o nicho. Se uma frase "
+        f"pode ser lida sem perder sentido num vídeo sobre outro tema qualquer, ela é "
+        f"genérica demais e precisa ser reescrita com um fato concreto no lugar."
+    )
+    instrucao_extra_completa = f"{instrucao_extra}\n{reforco_densidade}" if instrucao_extra else reforco_densidade
+
+    blocos = gerar_prosa(estrutura_prosa, contexto_nicho, idioma_conteudo, instrucao_extra_completa,
                           documento_estilo, palavras_alvo, gemini_generate_fn)
 
     titulos_capitulos = {f'capitulo_{i + 1}': cap['titulo']
@@ -537,6 +574,9 @@ Para cada bloco com problema, marque o tipo:
 - clichê: frase que poderia estar em qualquer vídeo do nicho
 - ritmo_quebrado: frase longa demais ou estrutura repetitiva
 - redundancia: informação repetida sem necessidade
+- generico: frase sem NENHUM fato específico (número, data, nome de lugar/pessoa/
+  instituição/lei) — se a frase pode ser lida sem perder sentido num vídeo sobre
+  qualquer outro tema do mesmo nicho, ela é genérica demais
 
 Retorne APENAS JSON, lista de problemas (vazio se não houver nenhum):
 {{"problemas": [{{"indice": 0, "tipo": "cliche", "motivo": "..."}}]}}"""

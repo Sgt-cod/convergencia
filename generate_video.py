@@ -81,6 +81,20 @@ SEGUNDOS_LEAD_IN = float(os.environ.get('SEGUNDOS_LEAD_IN', '3'))   # vídeo+mú
 SEGUNDOS_TAIL = float(os.environ.get('SEGUNDOS_TAIL', '5'))         # vídeo+música depois da narração
 SEGUNDOS_FADEOUT = float(os.environ.get('SEGUNDOS_FADEOUT', '2'))   # fade-out no final (vídeo + áudio)
 
+# ── Estrutura de tempo de CADA SEGMENTO no modo 'capitulos_webdoc' ───────────
+# BUGFIX: renderizar_segmento_webdoc() gerava vídeo_base com duração EXATAMENTE
+# igual à duração da narração (0s = 1ª palavra, fim = última palavra) e depois
+# aplicava fade-in/fade-out DIRETO em cima disso — ou seja, o fade recaía sobre a
+# própria fala (voz nascendo/morrendo em volume) em vez de sobre mídia muda antes/
+# depois dela. Igual ao lead-in/tail que criar_video_curto()/criar_video_longo()
+# já usam (linha ~1480), mas isso nunca tinha sido replicado pro modo em capítulos.
+# Aqui os valores são menores (2.5s/3s, não 3s/5s) porque isso se repete por
+# segmento (intro + cada capítulo + desfecho), não uma vez só no vídeo inteiro.
+SEGUNDOS_LEAD_IN_SEGMENTO = float(os.environ.get(
+    'SEGUNDOS_LEAD_IN_SEGMENTO', '2.5'))  # mídia muda antes da narração do segmento começar
+SEGUNDOS_TAIL_SEGMENTO = float(os.environ.get(
+    'SEGUNDOS_TAIL_SEGMENTO', '3'))       # mídia muda depois da narração do segmento terminar
+
 # ── Duração máxima por clipe do Pexels ───────────────────────────────────────
 # Evita que um único vídeo longo (ex: 2min) preencha o short inteiro sozinho.
 # Ajuste entre 15 e 30 conforme preferir mais ou menos variedade de cortes.
@@ -119,6 +133,14 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
+
+# config.json pode sobrescrever o padrão de 2.5s/3s definido acima (env var continua
+# tendo prioridade se for setada explicitamente — só cai pro config.json se a env var
+# não foi tocada, isto é, se ainda está no default do os.environ.get).
+if 'SEGUNDOS_LEAD_IN_SEGMENTO' not in os.environ and 'padding_inicio_segmento_webdoc' in config:
+    SEGUNDOS_LEAD_IN_SEGMENTO = float(config['padding_inicio_segmento_webdoc'])
+if 'SEGUNDOS_TAIL_SEGMENTO' not in os.environ and 'padding_fim_segmento_webdoc' in config:
+    SEGUNDOS_TAIL_SEGMENTO = float(config['padding_fim_segmento_webdoc'])
 
 DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
@@ -1690,21 +1712,66 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     if not lista_clipes:
         raise RuntimeError(f"Nenhum clipe de B-roll baixado pro segmento '{nome_segmento}'")
 
+    # duracao_segmento até aqui é a duração PURA da narração (0s = 1ª palavra falada,
+    # fim = última palavra). lista_clipes/clips_legenda/clips_destaque/eventos_sfx
+    # foram todos calculados em cima desse tempo "cru" — ou seja, tempo relativo ao
+    # INÍCIO DA FALA, não ao início do segmento renderizado.
+    #
+    # BUGFIX (voz "no limite", com fade sobre a própria fala): o segmento renderizado
+    # precisa ser MAIOR que a narração, com mídia muda (B-roll, sem narração) antes e
+    # depois dela — é sobre essa mídia muda que o fade-in/fade-out atua, não sobre a
+    # voz. Mesma técnica já usada em criar_video_curto()/criar_video_longo() (deslocar
+    # tudo por um "lead-in" e esticar o 1º/último clipe pra cobrir o tempo extra),
+    # replicada aqui pro modo em capítulos.
+    duracao_narracao = duracao_segmento
+    padding_inicio = SEGUNDOS_LEAD_IN_SEGMENTO
+    padding_fim = SEGUNDOS_TAIL_SEGMENTO
+    duracao_segmento = padding_inicio + duracao_narracao + padding_fim
+
     clips_video = _montar_clips_pexels(lista_clipes, largura, altura)
+
+    # Desloca todo o B-roll pra abrir espaço para o padding_inicio mudo no começo.
+    clips_video = [c.set_start(c.start + padding_inicio) for c in clips_video]
+
+    # O 1º clipe cobria [0, padding_inicio) antes deste deslocamento — era o padding
+    # mudo em si. Puxamos ele de volta pro instante 0 e esticamos sua duração pra
+    # cobrir esse intervalo (em vez de deixar o composite mostrar tela preta ali).
+    if clips_video:
+        primeiro = clips_video[0]
+        if primeiro.start > 0:
+            gap_inicial = primeiro.start
+            clips_video[0] = primeiro.set_start(0).set_duration(primeiro.duration + gap_inicial)
+
+        # Mesma lógica no fim: estica o último clipe pra cobrir o padding_fim mudo.
+        ultimo = clips_video[-1]
+        cobertura = ultimo.start + ultimo.duration
+        if cobertura < duracao_segmento:
+            clips_video[-1] = ultimo.set_duration(ultimo.duration + (duracao_segmento - cobertura))
+
+    # Legenda/destaque também foram calculados em tempo relativo à narração — deslocar
+    # junto, senão apareceriam padding_inicio segundos adiantados em relação à fala.
+    clips_legenda = [c.set_start(c.start + padding_inicio) for c in clips_legenda]
+    clips_destaque = [c.set_start(c.start + padding_inicio) for c in clips_destaque]
+
     video_base = CompositeVideoClip(clips_video + clips_legenda + clips_destaque,
                                      size=(largura, altura)).set_duration(duracao_segmento)
 
-    audio_narr = AudioFileClip(audio_path_seg)
-    audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx, offset=0.0)
+    audio_narr = AudioFileClip(audio_path_seg).set_start(padding_inicio)
+    audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx, offset=padding_inicio)
     audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_segmento, volume=0.06)
 
-    dur_fade = float(config.get('duracao_fade_conteudo', 2.0))
-    if fade_in:
-        video_base = video_base.fadein(dur_fade)
-        audio_final = audio_final.audio_fadein(dur_fade)
-    if fade_out:
-        video_base = video_base.fadeout(dur_fade)
-        audio_final = audio_final.audio_fadeout(dur_fade)
+    # Trava o fade pra nunca ultrapassar o padding mudo correspondente — mesmo que
+    # 'duracao_fade_conteudo' no config.json seja maior que o padding, o fade não pode
+    # comer nem meio segundo da voz.
+    dur_fade_config = float(config.get('duracao_fade_conteudo', 2.0))
+    dur_fade_in = min(dur_fade_config, padding_inicio)
+    dur_fade_out = min(dur_fade_config, padding_fim)
+    if fade_in and dur_fade_in > 0:
+        video_base = video_base.fadein(dur_fade_in)
+        audio_final = audio_final.audio_fadein(dur_fade_in)
+    if fade_out and dur_fade_out > 0:
+        video_base = video_base.fadeout(dur_fade_out)
+        audio_final = audio_final.audio_fadeout(dur_fade_out)
 
     return video_base.set_audio(audio_final)
 

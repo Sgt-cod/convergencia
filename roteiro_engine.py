@@ -214,6 +214,12 @@ REGRAS OBRIGATÓRIAS:
 - PROIBIDO usar: "mas o que isso realmente significa?", "e é aí que tudo muda",
   "prepare-se para descobrir", ou qualquer frase que serviria em vídeo sobre qualquer
   outro tema do mesmo nicho
+- Tom investigativo, não expositivo: pelo menos 2-3 blocos (não só a introdução) devem
+  conter uma pergunta provocativa/reflexiva genuína — que reformula o problema, expõe
+  uma contradição ou questiona quem se beneficia (ex: "Tem alguma coisa errada nesse
+  sistema?", "Quem lucra quando isso acontece?"), nunca uma pergunta retórica vazia
+  tipo "você já parou pra pensar?". A pergunta precisa ser específica ao FATO que
+  acabou de ser narrado naquele bloco, não genérica ao tema inteiro
 - Frases curtas, sem formatação, sem asteriscos, sem emojis
 - NÃO mencione apresentador, câmera ou elementos visuais
 - PROIBIDO incluir QUALQUER marcação técnica de produção: timecode (nem por extenso,
@@ -433,11 +439,18 @@ Regras:
   — não é uma frase completa (ex: "A Fábrica de Prédios", não "Por que os prédios são
   construídos assim")
 - A introdução abre CONTANDO o caso de ancoragem como cena (data, hora, número), não
-  com uma afirmação genérica sobre o tema
+  com uma afirmação genérica sobre o tema, e TERMINA com 1-2 perguntas provocativas/
+  reflexivas que reformulam o tema — o padrão é "e se o problema real não for X, mas
+  Y?" ou "quem ganha quando Z acontece?", nunca uma pergunta óbvia que qualquer um já
+  responderia. É essa pergunta que vira o fio condutor que o resto do vídeo responde.
 - Em "cobre", diga EXPLICITAMENTE que fato/número/nome específico aquele capítulo vai
   usar como evidência — não só o ângulo abstrato (isso é instrução pra quem for
-  escrever a prosa depois não fugir pro genérico)
-- O desfecho responde à pergunta implícita do vídeo citando de novo o caso de ancoragem
+  escrever a prosa depois não fugir pro genérico) — e, quando fizer sentido, que
+  pergunta provocativa esse capítulo levanta ou responde
+- O desfecho responde à pergunta implícita do vídeo citando de novo o caso de ancoragem,
+  e termina devolvendo a pergunta pro espectador de um jeito específico (não "e você, o
+  que acha?" genérico — algo que só faz sentido pra ESTE tema, ex: "e você, acha que
+  falta água mesmo, ou falta vontade de resolver o problema de verdade?")
 
 Retorne APENAS JSON:
 {{

@@ -65,7 +65,9 @@
     "calculator financial documents"
   ],
 
-  "correcoes_pronuncia": {},
+  "correcoes_pronuncia": {
+    "eua": "estados unidos"
+  },
 
   "idioma_conteudo": "português do Brasil",
   "idioma_whisper": "pt",

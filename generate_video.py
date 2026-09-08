@@ -1685,10 +1685,24 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
         for b, t in zip(blocos_com_tempo_local, termos):
             b['termo'] = t
 
-        if any(k != 'pexels' for k in config.get('pesos_fontes_midia', {'pexels': 1.0})):
-            termos_esp = escolher_termos_especificos_por_bloco(blocos_com_tempo_local, _gemini_generate)
-            for b, t in zip(blocos_com_tempo_local, termos_esp):
-                b['termo_especifico'] = t
+        # BUGFIX (mídia errada — cidade americana pra tragédia em Petrópolis, cédula
+        # polonesa pra investimento federal): isso SÓ era calculado quando
+        # 'pesos_fontes_midia' tinha alguma fonte além de pexels configurada em
+        # config.json — ou seja, na prática NUNCA rodava (o config não tem essa chave),
+        # e todo bloco caía sempre no termo GENÉRICO da lista pré-aprovada + Pexels, que
+        # é um banco de imagem global sem marcação de país: um termo tipo "money
+        # counting hands close up" pode voltar nota de qualquer moeda do mundo, e
+        # "abandoned building exterior" pode voltar prédio de qualquer país sem
+        # tragédia nenhuma. O termo_especifico (nome real do lugar/evento extraído do
+        # próprio bloco, ex: "Petrópolis 2022", "Real brasileiro") é o que permite
+        # buscar no Wikimedia Commons/Internet Archive uma imagem de fato ligada ao
+        # fato narrado — e esse gate não tinha relação nenhuma com "vale a pena tentar
+        # achar uma imagem específica", só com uma configuração de sorteio de fontes
+        # que é um recurso à parte. Agora roda sempre pro modo em capítulos, já que o
+        # custo é só 1 chamada extra ao Gemini por segmento.
+        termos_esp = escolher_termos_especificos_por_bloco(blocos_com_tempo_local, _gemini_generate)
+        for b, t in zip(blocos_com_tempo_local, termos_esp):
+            b['termo_especifico'] = t
 
         blocos_com_tempo_local = decidir_prints_de_noticia(
             blocos_com_tempo_local, _gemini_generate,

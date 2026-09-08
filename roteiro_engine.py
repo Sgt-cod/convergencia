@@ -221,7 +221,16 @@ REGRAS OBRIGATÓRIAS:
   nome de transição, rótulo de locutor/narrador, direção de cena. O texto de cada
   bloco tem que ser 100% falável em voz alta do primeiro ao último caractere — se ao
   reler um trecho ele soa como uma instrução PRA alguém produzir o vídeo, em vez de
-  uma frase QUE o narrador diria, ele não pode entrar no roteiro{linha_extra}
+  uma frase QUE o narrador diria, ele não pode entrar no roteiro
+- PROIBIDO usar siglas, abreviações ou qualquer atalho de letras pra se referir a um
+  país, órgão, lei ou instituição — o texto vai direto pra um TTS que lê tudo de forma
+  LITERAL, letra por letra, então "EUA" sai como "É-Ú-A" em vez de "Estados Unidos".
+  Escreva sempre por extenso ("Estados Unidos", "Organização das Nações Unidas",
+  "Produto Interno Bruto"), mesmo que isso repita a expressão várias vezes ao longo do
+  bloco. NUNCA invente uma abreviação curta (tipo uma letra ou duas) pra evitar repetir
+  um termo — se precisar variar, troque por uma expressão equivalente por extenso
+  ("o país", "a potência norte-americana", "o mercado americano"), nunca por uma sigla
+  ou código{linha_extra}
 
 Retorne APENAS JSON:
 {{
@@ -242,10 +251,96 @@ Retorne APENAS JSON:
         b['texto'] = sanitizar_direcoes_de_producao(b['texto'])
 
     total_palavras = sum(len(b['texto'].split()) for b in blocos)
-    if total_palavras < palavras_alvo * 0.7:
+    if total_palavras < palavras_alvo * 0.85:
         print(f"  ⚠️ Roteiro saiu com {total_palavras} palavras (meta: ~{palavras_alvo}) — "
-              f"o vídeo final vai ficar mais curto que o esperado. Se isso persistir, "
-              f"considere reduzir os exemplos de 'documento_estilo' ou torná-los mais longos.")
+              f"tentando expandir os blocos mais curtos antes de seguir...")
+        blocos = _expandir_blocos_curtos(blocos, palavras_por_bloco, palavras_alvo,
+                                          idioma_conteudo, gemini_generate_fn)
+        total_palavras = sum(len(b['texto'].split()) for b in blocos)
+        if total_palavras < palavras_alvo * 0.7:
+            print(f"  ⚠️ Mesmo após expansão, roteiro ficou com {total_palavras} palavras "
+                  f"(meta: ~{palavras_alvo}) — o vídeo final vai ficar mais curto que o "
+                  f"esperado. Se isso persistir, considere reduzir os exemplos de "
+                  f"'documento_estilo' ou torná-los mais longos.")
+        else:
+            print(f"  ✅ Roteiro expandido para {total_palavras} palavras.")
+
+    return blocos
+
+
+def _expandir_blocos_curtos(blocos, palavras_por_bloco, palavras_alvo, idioma_conteudo,
+                             gemini_generate_fn, tentativas=2):
+    """
+    LLMs pedidos por "~N palavras" numa única chamada, em especial gerando JSON
+    estruturado, tendem a SUBESTIMAR o tamanho pedido — é um padrão conhecido, não um
+    erro pontual. Em vez de só avisar no log e entregar um roteiro raso (o que estava
+    acontecendo antes), aqui os blocos que saíram abaixo da meta voltam pro modelo numa
+    chamada de reescrita cirúrgica (mesmo padrão de indexação de criticar_e_reescrever),
+    pedindo especificamente mais profundidade/detalhe/fatos concretos — nunca "encher
+    linguiça" com frase genérica — até chegar perto da meta de palavras por bloco.
+    Roda no máximo `tentativas` rodadas pra não entrar em loop se o modelo insistir em
+    devolver blocos curtos.
+    """
+    limite_bloco = palavras_por_bloco * 0.85
+
+    for _ in range(tentativas):
+        curtos = [
+            (i, b) for i, b in enumerate(blocos)
+            if len(b['texto'].split()) < limite_bloco
+        ]
+        if not curtos:
+            break
+
+        trechos = "\n".join(
+            f"[{i}] ({b['bloco']}, {len(b['texto'].split())} palavras, meta "
+            f"~{palavras_por_bloco}): {b['texto']}"
+            for i, b in curtos
+        )
+
+        prompt = f"""Os blocos de roteiro abaixo saíram MAIS CURTOS do que a meta de
+palavras. Reescreva cada um, mantendo o mesmo sentido e a mesma voz, mas DESENVOLVENDO
+mais a ideia até chegar perto da meta de palavras indicada — acrescente exemplos,
+dados concretos (número, data, nome de lugar/pessoa/instituição/lei), desdobramentos
+da mesma ideia ou uma segunda camada de explicação. NUNCA "encha linguiça" com frase
+genérica só pra bater a contagem — se não houver mais nada específico a acrescentar
+sobre aquele ponto, desenvolva uma implicação prática ou uma comparação concreta dele.
+Escreva em {idioma_conteudo}.
+
+{trechos}
+
+REGRAS: nunca use siglas/abreviações pra país/órgão/instituição (escreva por extenso,
+ex: "Estados Unidos", nunca "EUA" ou qualquer código curto) — o texto vai pra um TTS
+que lê tudo literalmente. "texto_novo" deve ser só o texto puro que vai ser narrado,
+sem o prefixo "[n] (bloco):" usado acima, sem colchetes, sem marcação técnica de
+produção (timecode, trilha, SFX, rótulo de locutor).
+
+Retorne APENAS JSON: {{"expansoes": [{{"indice": 0, "texto_novo": "..."}}]}}"""
+
+        try:
+            resposta = gemini_generate_fn(prompt)
+            expansoes = _extrair_json(resposta.text).get('expansoes', [])
+        except Exception as e:
+            print(f"  ⚠️ Expansão de bloco curto falhou ({e}) — mantendo texto atual")
+            break
+
+        padrao_prefixo = re.compile(r'^\s*\[\d+\]\s*\([^)]*\)\s*:\s*')
+        houve_ganho = False
+        for exp in expansoes:
+            i = exp.get('indice')
+            if not (isinstance(i, int) and 0 <= i < len(blocos) and exp.get('texto_novo')):
+                continue
+            texto_novo = re.sub(r'\*+', '', exp['texto_novo'])
+            texto_novo = texto_novo.replace('#', '').replace('_', '').strip()
+            texto_novo = padrao_prefixo.sub('', texto_novo).strip()
+            texto_novo = sanitizar_direcoes_de_producao(texto_novo)
+            # Só aceita se de fato ficou mais longo que o texto atual — nunca troca por
+            # algo mais curto ou igual (isso indicaria que o modelo não expandiu nada).
+            if len(texto_novo.split()) > len(blocos[i]['texto'].split()):
+                blocos[i]['texto'] = texto_novo
+                houve_ganho = True
+
+        if not houve_ganho:
+            break
 
     return blocos
 
@@ -606,6 +701,12 @@ IMPORTANTE — formato da resposta: "texto_novo" deve ser SÓ o texto puro que v
 narrado, exatamente como sairia numa legenda. NUNCA repita o prefixo "[n] (nome_do_bloco):"
 usado acima pra identificar os trechos — isso é só uma referência, não faz parte do roteiro.
 Não inclua colchetes, números de índice, nem o nome do bloco entre parênteses.
+
+IMPORTANTE — texto vai pra um TTS que lê tudo de forma LITERAL: se o texto original
+menciona um país/órgão/instituição por extenso (ex: "Estados Unidos"), o texto_novo
+tem que MANTER por extenso. Nunca troque isso por sigla, abreviação, ou por uma letra/
+código curto pra "variar" o texto ou evitar repetição — se precisar variar, use uma
+expressão equivalente por extenso ("o país", "a potência americana"), nunca uma sigla.
 
 Retorne APENAS JSON: {{"reescritas": [{{"indice": 0, "texto_novo": "..."}}]}}"""
 

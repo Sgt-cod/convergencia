@@ -8,6 +8,7 @@ from datetime import datetime
 import requests
 import edge_tts
 import numpy as np
+import urllib.parse
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import *
 from google import generativeai as genai
@@ -1164,14 +1165,19 @@ def buscar_imagem_wikimedia(termo, output_dir=None):
     """
     output_dir = output_dir or f'{ASSETS_DIR}/wikimedia'
     os.makedirs(output_dir, exist_ok=True)
+    # BUGFIX: o User-Agent era mandado só na chamada da API (w/api.php) — mas o
+    # download real do arquivo é noutro domínio (upload.wikimedia.org), que TAMBÉM
+    # exige User-Agent identificável (política da Wikimedia Foundation: requisição sem
+    # isso pode ser bloqueada/limitada silenciosamente, sem erro claro — só falha).
+    headers = {'User-Agent': 'WebdocPipeline/1.0 (uso educacional/canal YouTube)'}
     try:
         params = {
             'action': 'query', 'generator': 'search',
             'gsrsearch': f'{termo} filetype:bitmap', 'gsrnamespace': 6, 'gsrlimit': 10,
             'prop': 'imageinfo', 'iiprop': 'url|mime', 'iiurlwidth': 1920, 'format': 'json',
         }
-        resp = requests.get('https://commons.wikimedia.org/w/api.php', params=params, timeout=20,
-                             headers={'User-Agent': 'WebdocPipeline/1.0 (uso educacional/canal YouTube)'})
+        resp = requests.get('https://commons.wikimedia.org/w/api.php', params=params,
+                             timeout=20, headers=headers)
         resp.raise_for_status()
         paginas = list(resp.json().get('query', {}).get('pages', {}).values())
         random.shuffle(paginas)
@@ -1187,7 +1193,7 @@ def buscar_imagem_wikimedia(termo, output_dir=None):
             if not url:
                 continue
             destino = os.path.join(output_dir, f"wm_{pagina.get('pageid')}.jpg")
-            img_resp = requests.get(url, timeout=30)
+            img_resp = requests.get(url, timeout=30, headers=headers)
             img_resp.raise_for_status()
             with open(destino, 'wb') as f:
                 f.write(img_resp.content)
@@ -1206,10 +1212,19 @@ def buscar_imagem_internet_archive(termo, output_dir=None):
     """
     output_dir = output_dir or f'{ASSETS_DIR}/internet_archive'
     os.makedirs(output_dir, exist_ok=True)
+    # BUGFIX: nenhuma das 3 chamadas (busca/metadata/download) mandava User-Agent — o
+    # Internet Archive aplica rate-limit pesado (ou bloqueia de vez) requisições sem
+    # isso, especialmente vindas de IP de datacenter (exatamente o caso do GitHub
+    # Actions). E nomes de arquivo no Internet Archive frequentemente têm espaço/acento/
+    # caractere especial — montar a URL com f-string direto (sem urllib.parse.quote)
+    # quebra a requisição nesses casos, então o download falhava silenciosamente pra
+    # boa parte dos resultados.
+    headers = {'User-Agent': 'WebdocPipeline/1.0 (uso educacional/canal YouTube)'}
     try:
         params = {'q': f'{termo} AND mediatype:image', 'rows': 10, 'output': 'json'}
         params['fl[]'] = ['identifier', 'title']
-        resp = requests.get('https://archive.org/advancedsearch.php', params=params, timeout=20)
+        resp = requests.get('https://archive.org/advancedsearch.php', params=params,
+                             timeout=20, headers=headers)
         resp.raise_for_status()
         docs = resp.json().get('response', {}).get('docs', [])
         random.shuffle(docs)
@@ -1218,7 +1233,8 @@ def buscar_imagem_internet_archive(termo, output_dir=None):
             identifier = doc.get('identifier')
             if not identifier:
                 continue
-            meta_resp = requests.get(f'https://archive.org/metadata/{identifier}', timeout=20)
+            meta_resp = requests.get(f'https://archive.org/metadata/{identifier}',
+                                      timeout=20, headers=headers)
             meta_resp.raise_for_status()
             arquivos = meta_resp.json().get('files', [])
             candidatos = [a for a in arquivos
@@ -1227,9 +1243,10 @@ def buscar_imagem_internet_archive(termo, output_dir=None):
             if not candidatos:
                 continue
             arquivo = random.choice(candidatos)
-            url = f"https://archive.org/download/{identifier}/{arquivo['name']}"
+            nome_arquivo_codificado = urllib.parse.quote(arquivo['name'])
+            url = f"https://archive.org/download/{identifier}/{nome_arquivo_codificado}"
             destino = os.path.join(output_dir, f"ia_{identifier}_{os.path.basename(arquivo['name'])}")
-            img_resp = requests.get(url, timeout=30)
+            img_resp = requests.get(url, timeout=30, headers=headers)
             img_resp.raise_for_status()
             with open(destino, 'wb') as f:
                 f.write(img_resp.content)
@@ -1380,78 +1397,6 @@ def _mixar_musica_fundo(audio_narracao, duracao_total, volume=0.06, musicas_dir=
     return CompositeAudioClip([audio_narracao, musica])
 
 
-def _mixar_musica_por_capitulo(audio_narracao, duracao_total, marcos_capitulos, volume=0.06,
-                                musicas_dir='assets/musicas', crossfade=1.5):
-    """
-    Versão em capítulos do _mixar_musica_fundo: em vez de UMA faixa tocando o vídeo
-    inteiro, sorteia uma faixa DIFERENTE pra cada trecho entre marcos_capitulos (cada
-    capítulo tem sua própria "música tema", com crossfade suave na troca) — é o que dá
-    o "ritmo que muda por capítulo" descrito no formato Elementar.
-
-    marcos_capitulos: lista de instantes (float, segundos, já no tempo final do vídeo —
-    ou seja, já somado offset_narracao) em que um novo capítulo começa. O primeiro
-    trecho (introdução, antes do primeiro marco) também sorteia sua própria faixa.
-
-    Se assets/musicas/ tiver menos faixas que capítulos, repete faixas (sem travar o
-    pipeline) — mas avisa, porque idealmente cada capítulo tem uma faixa distinta.
-    Se marcos_capitulos vier vazio, cai pro comportamento de _mixar_musica_fundo (uma
-    faixa só) — modo webdoc sem capítulos detectados não quebra.
-    """
-    import glob
-    import math
-    from moviepy.editor import AudioFileClip, CompositeAudioClip, concatenate_audioclips
-
-    if not marcos_capitulos:
-        return _mixar_musica_fundo(audio_narracao, duracao_total, volume, musicas_dir)
-
-    musicas = (glob.glob(f'{musicas_dir}/*.mp3') + glob.glob(f'{musicas_dir}/*.wav') +
-               glob.glob(f'{musicas_dir}/*.ogg'))
-    if not musicas:
-        print("  ⚠️ Nenhuma música encontrada em assets/musicas/ — sem fundo")
-        return audio_narracao
-
-    limites = [0.0] + sorted(marcos_capitulos) + [duracao_total]
-    n_trechos = len(limites) - 1
-
-    pool = musicas.copy()
-    random.shuffle(pool)
-    if len(pool) < n_trechos:
-        print(f"  ⚠️ Só {len(pool)} música(s) em {musicas_dir}/ pra {n_trechos} trecho(s) — "
-              f"algumas vão repetir (ideal: 1 faixa distinta por capítulo)")
-        while len(pool) < n_trechos:
-            pool += musicas
-    faixas_por_trecho = pool[:n_trechos]
-
-    trechos_audio = []
-    for i in range(n_trechos):
-        inicio_trecho, fim_trecho = limites[i], limites[i + 1]
-        duracao_trecho = max(0.1, fim_trecho - inicio_trecho)
-        # folga de 'crossfade' extra no fim de cada trecho (exceto o último) pra sobrar
-        # material real pra sobrepor na transição, em vez de repetir silêncio
-        duracao_com_folga = duracao_trecho + (crossfade if i < n_trechos - 1 else 0)
-
-        musica = AudioFileClip(faixas_por_trecho[i])
-        if musica.duration < duracao_com_folga:
-            repeticoes = math.ceil(duracao_com_folga / musica.duration)
-            musica = concatenate_audioclips([musica] * repeticoes)
-        musica = musica.subclip(0, duracao_com_folga).volumex(volume)
-        print(f"  🎼 Capítulo {i + 1}: {os.path.basename(faixas_por_trecho[i])} "
-              f"(t={inicio_trecho:.1f}s–{fim_trecho:.1f}s)")
-
-        # BUGFIX: crossfadein/crossfadeout só existem em CLIPES DE VÍDEO no MoviePy
-        # (mexem em máscara/transparência) — em áudio o nome certo é audio_fadein/
-        # audio_fadeout. Aplicamos fade-out na cauda de todo trecho que não é o
-        # último, e fade-in na cabeça de todo trecho que não é o primeiro — as duas
-        # pontas se sobrepõem na janela de 'crossfade' segundos, dando o crossfade
-        # de verdade (sem isso, só a entrada suaviza e a saída corta seco).
-        if i > 0:
-            musica = musica.audio_fadein(crossfade)
-        if i < n_trechos - 1:
-            musica = musica.audio_fadeout(crossfade)
-        trechos_audio.append(musica.set_start(inicio_trecho))
-
-    return CompositeAudioClip([audio_narracao] + trechos_audio)
-
 
 def aplicar_sfx(audio_base, eventos_sfx, offset=0.0, sfx_dir='assets/sfx'):
     """
@@ -1587,10 +1532,9 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
     """Horizontal (long), com intro fixa de assets/intro/ ANTES do bloco lead-in/narração/tail.
 
     Usado pelos modos 'cadeia_completa'/'simples'. O modo 'capitulos_webdoc' usa
-    criar_video_webdoc_capitulos() em vez desta função — a estrutura de posicionamento
-    da vinheta e dos cards de capítulo é bem diferente (vinheta DEPOIS de uma abertura
-    sem vinheta, cards em silêncio real) pra valer a pena forçar as duas dentro da
-    mesma função.
+    montar_video_webdoc_por_capitulos() em vez desta função — lá cada capítulo é
+    renderizado como vídeo independente e depois concatenado, em vez de tudo numa
+    única linha do tempo com offset compartilhado.
     """
     print("📹 Criando vídeo longo (Pexels + intro)...")
     clips_legenda = clips_legenda or []
@@ -1676,41 +1620,107 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
     return output_file
 
 
-def _duracao_silencio_transicao(eh_apos_introducao, intro_duracao_vinheta):
+def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
+                                indice_segmento, fade_in, fade_out):
     """
-    Duração TOTAL de silêncio entre o fim da fala de um segmento e o início da fala do
-    próximo, no modo webdoc em capítulos. Usada IDENTICAMENTE por
-    montar_audio_webdoc_capitulos (que reserva esse silêncio no ÁUDIO) e por
-    criar_video_webdoc_capitulos (que posiciona fade/vinheta/card dentro dele) — as
-    duas TÊM que concordar em milissegundos, por isso isso vive numa função só, nunca
-    duplicado.
+    Gera o vídeo COMPLETO E AUTÔNOMO de UM segmento do modo webdoc (a introdução, um
+    capítulo, ou o desfecho): TTS -> Whisper -> termo/B-roll -> destaque/legenda -> SFX
+    -> música -> composite -> fade-in/fade-out — tudo em tempo LOCAL (0 = início deste
+    segmento). O resultado é um VideoClip fechado, pronto pra ser concatenado com a
+    vinheta e os cards via concatenate_videoclips, SEM nenhum cálculo de offset
+    compartilhado entre segmentos.
 
-    Sequência dentro desse silêncio (todas config.json, com esses padrões):
-    1. duracao_fade_conteudo (2s): a mídia do capítulo anterior funde pro preto
-    2. duracao_gap_pre_titulo (2s): tela preta "respirando", nada acontece ainda
-    3. [SÓ depois da introdução] intro_duracao_vinheta: a vinheta do canal toca inteira
-    4. duracao_card_capitulo (7s): o título do próximo capítulo, em branco, tela preta
+    É essa independência que garante, por CONSTRUÇÃO, que a voz de um capítulo nunca
+    vaza pra tela preta de outro — não existe mais uma linha do tempo única onde um
+    erro de alguns décimos de segundo pudesse causar isso; cada segmento já termina
+    (ou começa) exatamente onde o arquivo dele acaba (ou começa), ponto.
     """
-    fade = float(config.get('duracao_fade_conteudo', 2.0))
-    gap = float(config.get('duracao_gap_pre_titulo', 2.0))
-    card = float(config.get('duracao_card_capitulo', 7.0))
-    vinheta = intro_duracao_vinheta if eh_apos_introducao else 0.0
-    return fade + gap + vinheta + card
+    nome_segmento = grupo_blocos[0]['bloco']
+    print(f"  🎞️ Renderizando segmento '{nome_segmento}'...")
+
+    pasta = f'{ASSETS_DIR}/audio_segmentos'
+    os.makedirs(pasta, exist_ok=True)
+    texto_segmento = " ".join(aplicar_correcoes_pronuncia(b['texto']) for b in grupo_blocos)
+    audio_path_seg = f'{pasta}/seg_{indice_segmento:02d}.mp3'
+    criar_audio(texto_segmento, audio_path_seg)
+
+    try:
+        palavras_tempo = transcrever_palavras_com_timestamps(audio_path_seg)
+    except Exception as e:
+        print(f"    ⚠️ Falha na transcrição do segmento ({e}) — seguindo sem timestamps de palavra")
+        palavras_tempo = []
+
+    duracao_segmento = AudioFileClip(audio_path_seg).duration
+    blocos_com_tempo_local = mapear_tempos_para_blocos(grupo_blocos, palavras_tempo) if palavras_tempo else []
+
+    if not blocos_com_tempo_local:
+        termo_generico = escolher_termo_pesquisa(tema, texto_segmento)
+        lista_clipes = baixar_clipes_pexels(termo_generico, orientacao, duracao_segmento)
+        clips_legenda, clips_destaque, eventos_sfx = [], [], []
+    else:
+        termos_validados = config.get('termos_pesquisa_validados', [])
+        termos = escolher_termos_por_bloco(tema, blocos_com_tempo_local, termos_validados, _gemini_generate)
+        for b, t in zip(blocos_com_tempo_local, termos):
+            b['termo'] = t
+
+        if any(k != 'pexels' for k in config.get('pesos_fontes_midia', {'pexels': 1.0})):
+            termos_esp = escolher_termos_especificos_por_bloco(blocos_com_tempo_local, _gemini_generate)
+            for b, t in zip(blocos_com_tempo_local, termos_esp):
+                b['termo_especifico'] = t
+
+        blocos_com_tempo_local = decidir_prints_de_noticia(
+            blocos_com_tempo_local, _gemini_generate,
+            usar_prints_noticia=config.get('usar_prints_noticia', False)
+        )
+        lista_clipes = baixar_clipes_por_bloco(blocos_com_tempo_local, orientacao)
+
+        destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo_local, _gemini_generate)
+        destaques_resolvidos = resolver_destaques_com_tempo(
+            texto_segmento, palavras_tempo, blocos_com_tempo_local, destaques_por_bloco
+        )
+        eventos_sfx = construir_timeline_sfx(blocos_com_tempo_local, destaques_resolvidos)
+
+        clips_destaque = gerar_clips_destaque(texto_segmento, palavras_tempo, destaques_resolvidos,
+                                               largura, altura, offset=0.0)
+        if config.get('usar_legenda', True):
+            clips_legenda = gerar_clips_legenda(texto_segmento, palavras_tempo, largura, altura, offset=0.0)
+        else:
+            clips_legenda = []
+
+    if not lista_clipes:
+        raise RuntimeError(f"Nenhum clipe de B-roll baixado pro segmento '{nome_segmento}'")
+
+    clips_video = _montar_clips_pexels(lista_clipes, largura, altura)
+    video_base = CompositeVideoClip(clips_video + clips_legenda + clips_destaque,
+                                     size=(largura, altura)).set_duration(duracao_segmento)
+
+    audio_narr = AudioFileClip(audio_path_seg)
+    audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx, offset=0.0)
+    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_segmento, volume=0.06)
+
+    dur_fade = float(config.get('duracao_fade_conteudo', 2.0))
+    if fade_in:
+        video_base = video_base.fadein(dur_fade)
+        audio_final = audio_final.audio_fadein(dur_fade)
+    if fade_out:
+        video_base = video_base.fadeout(dur_fade)
+        audio_final = audio_final.audio_fadeout(dur_fade)
+
+    return video_base.set_audio(audio_final)
 
 
-def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta):
+def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura, altura, orientacao):
     """
-    Gera o áudio do modo 'capitulos_webdoc' segmento por segmento (introdução, cada
-    capítulo, desfecho) — CADA UM como uma chamada de TTS separada — e concatena tudo
-    com SILÊNCIO REAL nos pontos de troca de capítulo (ver _duracao_silencio_transicao
-    pra sequência exata: fade da mídia → respiro preto → [vinheta, só após a intro] →
-    card do capítulo).
+    Orquestra o modo 'capitulos_webdoc' do jeito insistido: cada segmento (introdução/
+    capítulo/desfecho) é renderizado como um vídeo TOTALMENTE PRONTO e AUTÔNOMO
+    (renderizar_segmento_webdoc), e só DEPOIS esses vídeos prontos são concatenados
+    com a vinheta e os cards de capítulo — via concatenate_videoclips, que garante
+    zero sobreposição/vazamento entre peças por construção (testado: MoviePy trata
+    clipes sem áudio, como o card e a vinheta, como silêncio automaticamente).
 
-    É esse silêncio de verdade no ÁUDIO — não um efeito visual sobreposto — que garante
-    o narrador terminar de falar ANTES da tela ir pro preto, em vez de ficar cortado
-    ao meio como acontecia quando o corte dependia só da precisão do Whisper.
-
-    Retorna audio_path (mesmo arquivo, sobrescrito com o áudio final concatenado).
+    Ordem final: [introdução (fade-out)] → [vinheta] → [card capítulo 1] →
+    [capítulo 1 (fade-in + fade-out)] → [card capítulo 2] → [capítulo 2 (fade-in +
+    fade-out)] → ... → [desfecho (fade-in + fade-out)].
     """
     segmentos = []
     atual = []
@@ -1722,151 +1732,50 @@ def montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinh
     if atual:
         segmentos.append(atual)
 
-    pasta = f'{ASSETS_DIR}/audio_segmentos'
-    os.makedirs(pasta, exist_ok=True)
-
-    print(f"  🎬 Gerando áudio em {len(segmentos)} segmento(s) (introdução/capítulos/desfecho)...")
-    clips_segmento = []
-    for i, grupo in enumerate(segmentos):
-        texto_segmento = " ".join(aplicar_correcoes_pronuncia(b['texto']) for b in grupo)
-        caminho_segmento = f'{pasta}/segmento_{i:02d}.mp3'
-        print(f"    Segmento {i + 1}/{len(segmentos)} ({grupo[0]['bloco']})...")
-        criar_audio(texto_segmento, caminho_segmento)
-        clips_segmento.append(AudioFileClip(caminho_segmento))
-
-    intercalados = []
-    for i, clip in enumerate(clips_segmento):
-        intercalados.append(clip)
-        if i < len(clips_segmento) - 1:
-            eh_apos_introducao = (i == 0)
-            duracao_silencio = _duracao_silencio_transicao(eh_apos_introducao, intro_duracao_vinheta)
-            intercalados.append(_silencio_audio(duracao_silencio))
-
-    audio_final = concatenate_audioclips(intercalados)
-    audio_final.write_audiofile(audio_path, logger=None)
-    for c in clips_segmento:
-        c.close()
-    audio_final.close()
-
-    print(f"  ✅ Áudio final montado: {AudioFileClip(audio_path).duration:.1f}s "
-          f"(incluindo os silêncios de fade/respiro/vinheta/card entre segmentos)")
-    return audio_path
-
-
-def criar_video_webdoc_capitulos(audio_path, blocos_com_tempo, lista_clipes, output_file,
-                                  duracao_narracao, clips_legenda=None, clips_destaque=None,
-                                  eventos_sfx=None):
-    """
-    Montagem do modo 'capitulos_webdoc': SEM vinheta no início — o vídeo já abre
-    falando/mostrando conteúdo (a "introdução", ~1min), termina em fade-to-black de 2s,
-    SÓ ENTÃO a vinheta do canal toca, seguida do card preto do capítulo 1 (mudo).
-    Cada capítulo depois disso termina em fade-to-black de 2s → card do próximo
-    capítulo (mudo) → capítulo seguinte — até o desfecho.
-
-    Pré-requisito: audio_path já foi montado por montar_audio_webdoc_capitulos(), então
-    duracao_narracao aqui já inclui os silêncios reais de vinheta/card — a duração
-    total do vídeo é exatamente duracao_narracao, sem nenhuma soma extra de intro.
-    """
-    print("📹 Criando vídeo webdoc em capítulos (abertura → vinheta → capítulos)...")
-    clips_legenda = clips_legenda or []
-    clips_destaque = clips_destaque or []
-
     import glob
     intros = glob.glob(f'{ASSETS_DIR}/intro/*.mp4') + glob.glob(f'{ASSETS_DIR}/intro/*.mov')
-    intro_clip_bruto, intro_duracao = None, 0.0
+    vinheta_clip = None
     if intros:
         intro_path = random.choice(intros) if len(intros) > 1 else intros[0]
-        print(f"  🎬 Vinheta (após a abertura): {os.path.basename(intro_path)}")
-        intro_clip_bruto = VideoFileClip(intro_path).resize(height=1080)
-        if intro_clip_bruto.w > 1920:
-            intro_clip_bruto = intro_clip_bruto.crop(x_center=intro_clip_bruto.w / 2, width=1920, height=1080)
-        elif intro_clip_bruto.w < 1920:
-            intro_clip_bruto = intro_clip_bruto.resize(width=1920)
-        if intro_clip_bruto.size != (1920, 1080):
-            intro_clip_bruto = intro_clip_bruto.resize((1920, 1080))
-        intro_clip_bruto = intro_clip_bruto.without_audio()
-        intro_duracao = intro_clip_bruto.duration
+        print(f"  🎬 Vinheta: {os.path.basename(intro_path)}")
+        vinheta_bruta = VideoFileClip(intro_path).resize(height=altura)
+        if vinheta_bruta.w > largura:
+            vinheta_bruta = vinheta_bruta.crop(x_center=vinheta_bruta.w / 2, width=largura, height=altura)
+        elif vinheta_bruta.w < largura:
+            vinheta_bruta = vinheta_bruta.resize(width=largura)
+        if vinheta_bruta.size != (largura, altura):
+            vinheta_bruta = vinheta_bruta.resize((largura, altura))
+        vinheta_clip = vinheta_bruta.without_audio()
     else:
         print("  ℹ️ Nenhuma vinheta encontrada em assets/intro/ — seguindo sem vinheta")
 
-    clips_video = _montar_clips_pexels(lista_clipes, 1920, 1080)
-    # Aqui NÃO somamos intro_duracao/SEGUNDOS_LEAD_IN como em criar_video_longo — os
-    # timestamps de blocos_com_tempo (e portanto de lista_clipes, clips_legenda,
-    # clips_destaque, eventos_sfx) já são o tempo FINAL de verdade, porque o áudio foi
-    # montado com os silêncios de fade/respiro/vinheta/card já embutidos (ver
-    # montar_audio_webdoc_capitulos/_duracao_silencio_transicao) — o Whisper transcreveu
-    # esse áudio final, não um áudio "cru" que precisasse de deslocamento depois.
-    duracao_fade = float(config.get('duracao_fade_conteudo', 2.0))
-    duracao_gap = float(config.get('duracao_gap_pre_titulo', 2.0))
     duracao_card = float(config.get('duracao_card_capitulo', 7.0))
 
-    overlays = []
-    for idx in range(len(blocos_com_tempo) - 1):
-        b_atual = blocos_com_tempo[idx]
-        b_prox = blocos_com_tempo[idx + 1]
-        if not b_prox.get('inicio_capitulo'):
-            continue  # troca comum de mídia dentro do mesmo capítulo — sem card, sem fade especial
+    clips_finais = []
+    for i, grupo in enumerate(segmentos):
+        fade_in = (i > 0)  # a introdução (i=0) é o próprio início do vídeo — sem fade-in
+        clip_segmento = renderizar_segmento_webdoc(grupo, tema, largura, altura, orientacao,
+                                                    i, fade_in=fade_in, fade_out=True)
+        clips_finais.append(clip_segmento)
 
-        eh_antes_do_capitulo_1 = (idx == 0)
-        fim_conteudo = b_atual['fim']  # instante em que o narrador REALMENTE para de falar
+        if i < len(segmentos) - 1:
+            if i == 0 and vinheta_clip:
+                clips_finais.append(vinheta_clip)
+            titulo_proximo = segmentos[i + 1][0].get('titulo_capitulo', '')
+            card = gerar_card_capitulo(titulo_proximo, largura, altura, duracao=duracao_card)
+            clips_finais.append(card)
 
-        # 1) a mídia funde pro preto DEPOIS que a fala já terminou — nunca durante,
-        #    porque agora existe silêncio real reservado no áudio pra isso (sem
-        #    depender da precisão do Whisper pra não cortar a última palavra)
-        preto = ColorClip((1920, 1080), color=(0, 0, 0), duration=duracao_fade)
-        preto = preto.fadein(duracao_fade).set_start(fim_conteudo)
-        overlays.append(preto)
-        cursor = fim_conteudo + duracao_fade
+    print(f"  🔗 Concatenando {len(clips_finais)} peça(s) (segmentos + vinheta + cards)...")
+    video_final = concatenate_videoclips(clips_finais, method='compose')
+    video_final = video_final.fadeout(SEGUNDOS_FADEOUT)
+    if video_final.audio:
+        video_final = video_final.set_audio(video_final.audio.audio_fadeout(SEGUNDOS_FADEOUT))
 
-        # 2) "respiro" em tela preta, sem nada acontecendo ainda (o preto já está
-        #    sólido desde o fim do fade — não precisa de clipe nenhum aqui, só avançar
-        #    o cursor; o composite já mostra preto por padrão onde não há clipe)
-        cursor += duracao_gap
-
-        # 3) vinheta do canal — só na transição pro capítulo 1
-        if eh_antes_do_capitulo_1 and intro_clip_bruto:
-            overlays.append(intro_clip_bruto.set_start(cursor))
-            cursor += intro_duracao
-
-        # 4) card do capítulo — a próxima fala só começa exatamente quando ele termina
-        card = gerar_card_capitulo(b_prox.get('titulo_capitulo', ''), 1920, 1080, duracao=duracao_card)
-        overlays.append(card.set_start(cursor))
-        cursor += duracao_card
-
-        # conferência: cursor tem que bater exato com b_prox['inicio'] — se não bater,
-        # é sinal de que _duracao_silencio_transicao (áudio) e este cálculo (vídeo)
-        # ficaram fora de sincronia (ver comentário na função compartilhada)
-        if abs(cursor - b_prox['inicio']) > 0.05:
-            print(f"    ⚠️ Encaixe de transição com {abs(cursor - b_prox['inicio']):.2f}s de folga "
-                  f"em '{b_prox['bloco']}' — confira _duracao_silencio_transicao")
-
-    n_capitulos = len([b for b in blocos_com_tempo if b.get('inicio_capitulo')])
-    if overlays:
-        print(f"  📑 {n_capitulos} card(s) de capítulo + vinheta + fade-to-black inseridos")
-
-    marcos_capitulos = [b['inicio'] for b in blocos_com_tempo if b.get('inicio_capitulo')]
-
-    todos_os_clips = clips_video + overlays + clips_legenda + clips_destaque
-    if not todos_os_clips:
-        return None
-
-    video_base = CompositeVideoClip(todos_os_clips, size=(1920, 1080)).set_duration(duracao_narracao)
-    video_base = video_base.fadeout(SEGUNDOS_FADEOUT)
-
-    audio_narr = AudioFileClip(audio_path)
-    audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=0.0)
-    audio_final = _mixar_musica_por_capitulo(audio_com_sfx, duracao_narracao, marcos_capitulos, volume=0.06)
-    audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
-
-    video_final = video_base.set_audio(audio_final)
     video_final.write_videofile(output_file, fps=24, codec='libx264', audio_codec='aac',
                                  preset='medium', bitrate='6000k', threads=4)
-
     video_final.close()
-    audio_narr.close()
-    for c in todos_os_clips:
-        c.close()
     return output_file
+
 
 
 _FONTE_TTF_CANDIDATOS = [
@@ -2480,7 +2389,7 @@ def main():
     audio_path = f'{ASSETS_DIR}/audio.mp3'
     eh_webdoc_capitulos = (pacote_roteiro.get('modo') == 'capitulos_webdoc')
     print(f"🧭 Modo de roteiro resultante: '{pacote_roteiro.get('modo')}' "
-          f"({'vinheta após abertura, cards por capítulo' if eh_webdoc_capitulos else 'vinheta no início, sem cards'})")
+          f"({'capítulos independentes renderizados e concatenados' if eh_webdoc_capitulos else 'linha do tempo única'})")
     if config.get('modo_roteiro') == 'capitulos_webdoc' and not eh_webdoc_capitulos:
         print("  ⚠️ ATENÇÃO: config.json pede 'capitulos_webdoc' mas o roteiro caiu no modo de "
               "EMERGÊNCIA (fallback_simples) — a cadeia de capítulos falhou em algum estágio "
@@ -2489,9 +2398,8 @@ def main():
 
     # BUGFIX (Wikimedia/Internet Archive nunca sendo tentados): antes, diversidade de
     # mídia era 100% opt-in via 'pesos_fontes_midia' no config.json — mas isso é fácil
-    # de esquecer de configurar, e webdoc SEM diversidade de fonte foi reportado como
-    # problema real mais de uma vez. Agora, se o modo é 'capitulos_webdoc' e a chave não
-    # foi definida explicitamente, injeta um padrão sensato — só pra ESTE modo (o canal
+    # de esquecer de configurar. Agora, se o modo é 'capitulos_webdoc' e a chave não foi
+    # definida explicitamente, injeta um padrão sensato — só pra ESTE modo (o canal
     # devocional/cadeia_completa continua 100% Pexels por padrão, comportamento antigo
     # intocado). Definir 'pesos_fontes_midia' no config.json continua funcionando pra
     # quem quiser um mix diferente.
@@ -2500,21 +2408,44 @@ def main():
         print(f"  🌐 'pesos_fontes_midia' não configurado — usando padrão de diversidade "
               f"pro modo webdoc: {config['pesos_fontes_midia']}")
 
-    if eh_webdoc_capitulos:
-        # Modo capítulos: cada segmento (introdução/capítulo/desfecho) é gerado como
-        # áudio SEPARADO e concatenado com SILÊNCIO REAL nos pontos de troca de
-        # capítulo — é isso que garante o card de transição não ser narrado (ver
-        # docstring de montar_audio_webdoc_capitulos). intro_duracao_vinheta precisa
-        # ser conhecida ANTES de montar o áudio, pra reservar o silêncio certo.
-        import glob
-        intros_probe = glob.glob(f'{ASSETS_DIR}/intro/*.mp4') + glob.glob(f'{ASSETS_DIR}/intro/*.mov')
-        intro_duracao_vinheta = 0.0
-        if intros_probe:
-            _clip_probe = VideoFileClip(intros_probe[0])
-            intro_duracao_vinheta = _clip_probe.duration
-            _clip_probe.close()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    video_path = f'{VIDEOS_DIR}/{VIDEO_TYPE}_{timestamp}.mp4'
 
-        montar_audio_webdoc_capitulos(blocos_roteiro, audio_path, intro_duracao_vinheta)
+    if eh_webdoc_capitulos:
+        # Cada segmento (introdução/capítulo/desfecho) é gerado e renderizado como um
+        # vídeo TOTALMENTE AUTÔNOMO (áudio, B-roll, legenda, destaque, SFX, música,
+        # fade-in/out próprios) DENTRO de montar_video_webdoc_por_capitulos — e só
+        # depois esses vídeos prontos são concatenados com a vinheta e os cards. Não
+        # existe mais uma linha do tempo global com offset compartilhado pra essa
+        # parte do pipeline (ver a função pra entender por quê: é isso que garante,
+        # por construção, que a voz de um capítulo nunca vaza pra tela preta de outro).
+        largura_v = 1080 if VIDEO_TYPE == 'short' else 1920
+        altura_v = 1920 if VIDEO_TYPE == 'short' else 1080
+        orientacao_v = 'portrait' if VIDEO_TYPE == 'short' else 'landscape'
+
+        print("🎥 Montando vídeo (capítulos independentes, renderizados e depois concatenados)...")
+        try:
+            resultado = montar_video_webdoc_por_capitulos(
+                blocos_roteiro, tema, video_path, largura_v, altura_v, orientacao_v
+            )
+            if not resultado:
+                print("❌ Erro ao criar vídeo")
+                return
+            print("✅ Vídeo criado!")
+        except Exception as e:
+            print(f"❌ Erro: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+        # BUGFIX: no modo webdoc não existe mais um 'duracao_narracao' global (cada
+        # segmento tem a própria duração, calculada e descartada dentro de
+        # renderizar_segmento_webdoc) — mas o log final mais abaixo espera essa
+        # variável existir. Lê a duração do vídeo já pronto em disco.
+        duracao_narracao = VideoFileClip(video_path).duration
+
+        termo = escolher_termo_pesquisa(tema, roteiro)  # só usado abaixo pra thumbnail
+
     else:
         texto_falado = aplicar_correcoes_pronuncia(roteiro)
         # A pausa entre frases (config 'duracao_pausa_frases_ms') agora é aplicada DENTRO
@@ -2522,117 +2453,104 @@ def main():
         # pós-processamento cego em cima do áudio pronto (ver bugfix no próprio arquivo).
         criar_audio(texto_falado, audio_path)
 
-    audio_clip = AudioFileClip(audio_path)
-    duracao_narracao = audio_clip.duration
-    audio_clip.close()
-    print(f"⏱️ {duracao_narracao:.1f}s de narração")
+        audio_clip = AudioFileClip(audio_path)
+        duracao_narracao = audio_clip.duration
+        audio_clip.close()
+        print(f"⏱️ {duracao_narracao:.1f}s de narração")
 
-    # Fase 2: transcreve UMA VEZ aqui (cedo) e reaproveita em tudo que segue —
-    # mapeamento de bloco, legenda comum e destaque visual não retranscrevem.
-    print("🧠 Transcrevendo narração (relógio mestre para B-roll/legenda/destaque/SFX)...")
-    try:
-        palavras_tempo = transcrever_palavras_com_timestamps(audio_path)
-    except Exception as e:
-        print(f"⚠️ Falha na transcrição ({e}) — seguindo sem timestamps de palavra")
-        palavras_tempo = []
+        # Fase 2: transcreve UMA VEZ aqui (cedo) e reaproveita em tudo que segue —
+        # mapeamento de bloco, legenda comum e destaque visual não retranscrevem.
+        print("🧠 Transcrevendo narração (relógio mestre para B-roll/legenda/destaque/SFX)...")
+        try:
+            palavras_tempo = transcrever_palavras_com_timestamps(audio_path)
+        except Exception as e:
+            print(f"⚠️ Falha na transcrição ({e}) — seguindo sem timestamps de palavra")
+            palavras_tempo = []
 
-    orientacao = 'portrait' if VIDEO_TYPE == 'short' else 'landscape'
-    duracao_bloco_video = SEGUNDOS_LEAD_IN + duracao_narracao + SEGUNDOS_TAIL
+        orientacao = 'portrait' if VIDEO_TYPE == 'short' else 'landscape'
+        duracao_bloco_video = SEGUNDOS_LEAD_IN + duracao_narracao + SEGUNDOS_TAIL
 
-    if palavras_tempo:
-        blocos_com_tempo = mapear_tempos_para_blocos(blocos_roteiro, palavras_tempo)
+        if palavras_tempo:
+            blocos_com_tempo = mapear_tempos_para_blocos(blocos_roteiro, palavras_tempo)
 
-        termos_validados = config.get('termos_pesquisa_validados', [])
-        print("🔍 Escolhendo termo de busca por bloco (B-roll casado com o que está sendo dito)...")
-        termos_por_bloco = escolher_termos_por_bloco(tema, blocos_com_tempo, termos_validados, _gemini_generate)
-        for bloco, termo_bloco in zip(blocos_com_tempo, termos_por_bloco):
-            bloco['termo'] = termo_bloco
+            termos_validados = config.get('termos_pesquisa_validados', [])
+            print("🔍 Escolhendo termo de busca por bloco (B-roll casado com o que está sendo dito)...")
+            termos_por_bloco = escolher_termos_por_bloco(tema, blocos_com_tempo, termos_validados, _gemini_generate)
+            for bloco, termo_bloco in zip(blocos_com_tempo, termos_por_bloco):
+                bloco['termo'] = termo_bloco
 
-        # Termo ESPECÍFICO (nome de lugar/evento/órgão real) só pra Wikimedia/Internet
-        # Archive — o termo genérico acima é ótimo pro Pexels, mas quase nunca acha nada
-        # relevante no Wikimedia (que precisa de entidade real, não descrição de banco
-        # de imagem). Só roda se alguma fonte alternativa estiver configurada, pra não
-        # gastar uma chamada de Gemini à toa quando o canal usa só Pexels (padrão).
-        if any(k != 'pexels' for k in config.get('pesos_fontes_midia', {'pexels': 1.0})):
-            termos_especificos = escolher_termos_especificos_por_bloco(blocos_com_tempo, _gemini_generate)
-            for bloco, termo_esp in zip(blocos_com_tempo, termos_especificos):
-                bloco['termo_especifico'] = termo_esp
+            # Termo ESPECÍFICO (nome de lugar/evento/órgão real) só pra Wikimedia/Internet
+            # Archive — o termo genérico acima é ótimo pro Pexels, mas quase nunca acha nada
+            # relevante no Wikimedia (que precisa de entidade real, não descrição de banco
+            # de imagem). Só roda se alguma fonte alternativa estiver configurada, pra não
+            # gastar uma chamada de Gemini à toa quando o canal usa só Pexels (padrão).
+            if any(k != 'pexels' for k in config.get('pesos_fontes_midia', {'pexels': 1.0})):
+                termos_especificos = escolher_termos_especificos_por_bloco(blocos_com_tempo, _gemini_generate)
+                for bloco, termo_esp in zip(blocos_com_tempo, termos_especificos):
+                    bloco['termo_especifico'] = termo_esp
 
-        # Webdoc, opt-in via config.json ('usar_prints_noticia': true) — inerte pro canal
-        # atual, que não tem essa chave. Ver producao_visual.decidir_prints_de_noticia.
-        blocos_com_tempo = decidir_prints_de_noticia(
-            blocos_com_tempo, _gemini_generate,
-            usar_prints_noticia=config.get('usar_prints_noticia', False)
-        )
+            # Webdoc, opt-in via config.json ('usar_prints_noticia': true) — inerte pro canal
+            # atual, que não tem essa chave. Ver producao_visual.decidir_prints_de_noticia.
+            blocos_com_tempo = decidir_prints_de_noticia(
+                blocos_com_tempo, _gemini_generate,
+                usar_prints_noticia=config.get('usar_prints_noticia', False)
+            )
 
-        lista_clipes = baixar_clipes_por_bloco(blocos_com_tempo, orientacao)
+            lista_clipes = baixar_clipes_por_bloco(blocos_com_tempo, orientacao)
 
-        print("✨ Escolhendo palavras de destaque...")
-        destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo, _gemini_generate)
-        destaques_resolvidos = resolver_destaques_com_tempo(
-            roteiro, palavras_tempo, blocos_com_tempo, destaques_por_bloco
-        )
-        eventos_sfx = construir_timeline_sfx(blocos_com_tempo, destaques_resolvidos)
+            print("✨ Escolhendo palavras de destaque...")
+            destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo, _gemini_generate)
+            destaques_resolvidos = resolver_destaques_com_tempo(
+                roteiro, palavras_tempo, blocos_com_tempo, destaques_por_bloco
+            )
+            eventos_sfx = construir_timeline_sfx(blocos_com_tempo, destaques_resolvidos)
 
-        largura_legenda = 1080 if VIDEO_TYPE == 'short' else 1920
-        altura_legenda = 1920 if VIDEO_TYPE == 'short' else 1080
-        # No modo webdoc em capítulos, blocos_com_tempo/lista_clipes/audio_path já usam
-        # tempo "puro" (0 = início real da narração, sem vinheta antes) — ver
-        # criar_video_webdoc_capitulos, que não soma nenhum offset por conta própria.
-        # Nos outros modos, SEGUNDOS_LEAD_IN é o espaço de vídeo+música ANTES da
-        # narração começar (e quem soma intro_duracao em cima é criar_video_longo).
-        offset_legenda = 0.0 if eh_webdoc_capitulos else SEGUNDOS_LEAD_IN
-        # Formato webdoc costuma preferir só a palavra de destaque na tela, sem legenda
-        # corrida por baixo (visual mais limpo, menos "poluído") — config.json →
-        # 'usar_legenda': false. Destaque continua sempre ativo (não tem toggle próprio
-        # porque é o elemento visual mais forte do formato, não teria por que desligar).
-        if config.get('usar_legenda', True):
-            clips_legenda = gerar_clips_legenda(roteiro, palavras_tempo, largura_legenda, altura_legenda,
-                                                 offset=offset_legenda)
+            largura_legenda = 1080 if VIDEO_TYPE == 'short' else 1920
+            altura_legenda = 1920 if VIDEO_TYPE == 'short' else 1080
+            offset_legenda = SEGUNDOS_LEAD_IN  # NÃO inclui intro — quem soma intro_duracao é criar_video_longo
+            # Formato webdoc costuma preferir só a palavra de destaque na tela, sem legenda
+            # corrida por baixo (visual mais limpo, menos "poluído") — config.json →
+            # 'usar_legenda': false. Destaque continua sempre ativo (não tem toggle próprio
+            # porque é o elemento visual mais forte do formato, não teria por que desligar).
+            if config.get('usar_legenda', True):
+                clips_legenda = gerar_clips_legenda(roteiro, palavras_tempo, largura_legenda, altura_legenda,
+                                                     offset=offset_legenda)
+            else:
+                clips_legenda = []
+            clips_destaque = gerar_clips_destaque(roteiro, palavras_tempo, destaques_resolvidos,
+                                                   largura_legenda, altura_legenda, offset=offset_legenda)
+            termo = termos_por_bloco[0] if termos_por_bloco else ''  # usado só na busca de foto da thumbnail
         else:
-            clips_legenda = []
-        clips_destaque = gerar_clips_destaque(roteiro, palavras_tempo, destaques_resolvidos,
-                                               largura_legenda, altura_legenda, offset=offset_legenda)
-        termo = termos_por_bloco[0] if termos_por_bloco else ''  # usado só na busca de foto da thumbnail
-    else:
-        # sem timestamps não dá pra fazer nada da Fase 2 — cai pro comportamento antigo
-        # (1 termo pro vídeo inteiro, sem legenda/destaque/SFX sincronizados)
-        termo = escolher_termo_pesquisa(tema, roteiro)
-        lista_clipes = baixar_clipes_pexels(termo, orientacao, duracao_bloco_video)
-        clips_legenda, clips_destaque, eventos_sfx = [], [], []
-        blocos_com_tempo = []  # sem isso, criar_video_longo(blocos_com_tempo=...) abaixo quebraria com NameError
+            # sem timestamps não dá pra fazer nada da Fase 2 — cai pro comportamento antigo
+            # (1 termo pro vídeo inteiro, sem legenda/destaque/SFX sincronizados)
+            termo = escolher_termo_pesquisa(tema, roteiro)
+            lista_clipes = baixar_clipes_pexels(termo, orientacao, duracao_bloco_video)
+            clips_legenda, clips_destaque, eventos_sfx = [], [], []
 
-    if not lista_clipes:
-        print("❌ Nenhum clipe baixado — abortando este ciclo.")
-        return
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    video_path = f'{VIDEOS_DIR}/{VIDEO_TYPE}_{timestamp}.mp4'
-
-    print("🎥 Montando vídeo...")
-    try:
-        if VIDEO_TYPE == 'short':
-            resultado = criar_video_curto(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
-                                           clips_legenda=clips_legenda, clips_destaque=clips_destaque,
-                                           eventos_sfx=eventos_sfx)
-        elif eh_webdoc_capitulos:
-            resultado = criar_video_webdoc_capitulos(audio_path, blocos_com_tempo, lista_clipes, video_path,
-                                                       duracao_narracao, clips_legenda=clips_legenda,
-                                                       clips_destaque=clips_destaque, eventos_sfx=eventos_sfx)
-        else:
-            resultado = criar_video_longo(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
-                                           clips_legenda=clips_legenda, clips_destaque=clips_destaque,
-                                           eventos_sfx=eventos_sfx)
-
-        if not resultado:
-            print("❌ Erro ao criar vídeo")
+        if not lista_clipes:
+            print("❌ Nenhum clipe baixado — abortando este ciclo.")
             return
-        print("✅ Vídeo criado!")
-    except Exception as e:
-        print(f"❌ Erro: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+
+        print("🎥 Montando vídeo...")
+        try:
+            if VIDEO_TYPE == 'short':
+                resultado = criar_video_curto(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
+                                               clips_legenda=clips_legenda, clips_destaque=clips_destaque,
+                                               eventos_sfx=eventos_sfx)
+            else:
+                resultado = criar_video_longo(audio_path, roteiro, lista_clipes, video_path, duracao_narracao,
+                                               clips_legenda=clips_legenda, clips_destaque=clips_destaque,
+                                               eventos_sfx=eventos_sfx)
+
+            if not resultado:
+                print("❌ Erro ao criar vídeo")
+                return
+            print("✅ Vídeo criado!")
+        except Exception as e:
+            print(f"❌ Erro: {e}")
+            import traceback
+            traceback.print_exc()
+            return
 
     titulo = titulo_video[:60] if len(titulo_video) <= 60 else titulo_video[:57] + '...'
     if VIDEO_TYPE == 'short':

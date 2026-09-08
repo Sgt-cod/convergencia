@@ -97,6 +97,16 @@ casando o termo com o que aquele trecho específico está dizendo (não com o v�
 Prefira variar entre blocos diferentes — só repita o mesmo termo em dois blocos se
 genuinamente não houver opção melhor pra um deles.
 
+IMPORTANTE — evite ambiguidade de país: essa é uma busca de banco de imagens GLOBAL
+(Pexels), sem filtro de país. Um termo genérico como "money counting hands close up"
+ou "office workers meeting" pode voltar imagem/vídeo de QUALQUER lugar do mundo — já
+aconteceu de um bloco sobre investimento no Brasil vir ilustrado com cédula de outro
+país só porque o termo escolhido não tinha "brazil"/"brasil" nele. Por isso: se a
+lista pré-aprovada tiver DUAS opções pro mesmo conceito, uma com país marcado (ex:
+"bank notes brazilian real") e outra genérica (ex: "money counting hands close up"),
+e o bloco menciona ou implica o Brasil, escolha SEMPRE a versão com país marcado. Só
+use a genérica se não houver NENHUMA versão com país marcado pra aquele conceito.
+
 LISTA PRÉ-APROVADA:
 {json.dumps(termos_validados, ensure_ascii=False)}
 
@@ -151,9 +161,16 @@ def escolher_termos_especificos_por_bloco(blocos_com_tempo, gemini_generate_fn):
     )
     prompt = f"""Para CADA bloco numerado abaixo, extraia UMA entidade real e específica
 mencionada no texto — nome de cidade/lugar, evento histórico, órgão público, lei,
-empresa, monumento. Isso vai virar uma busca de imagem no Wikimedia Commons, então
-precisa ser algo que provavelmente TEM foto lá (lugar/evento/instituição real e
-razoavelmente conhecido) — não invente, não force se o bloco não tiver nada assim.
+empresa, monumento, moeda/cédula. Isso vai virar uma busca de imagem no Wikimedia
+Commons, então precisa ser algo que provavelmente TEM foto lá (lugar/evento/instituição
+real e razoavelmente conhecido) — não invente, não force se o bloco não tiver nada assim.
+
+IMPORTANTE — sempre inclua o PAÍS/região no termo quando fizer sentido, mesmo que o
+bloco não repita a palavra "Brasil" explicitamente (ex: se o bloco fala de uma cidade
+brasileira específica, escreva "Petrópolis Brasil", não só "Petrópolis"; se fala de
+"investimento federal" ou "verba pública" nesse contexto, escreva "cédula Real
+brasileiro", não só "dinheiro" ou "moeda"). Sem essa marcação de país, a busca corre o
+risco de achar imagem de outro lugar/moeda que só parece certa por acaso.
 
 Se o bloco for genérico (reflexão, transição, sem menção específica), retorne null
 pra ele.

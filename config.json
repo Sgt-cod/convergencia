@@ -7,6 +7,8 @@
   
   "voz_fallback": "pt-BR-AntonioNeural",
   "metodo_thumbnail": "pexels_agnes",
+  "fonte_thumbnail_arquivo": "assets/fonts/Rowdies-Bold.ttf",
+  "fonte_destaque_arquivo": "assets/fonts/Rowdies-Bold.ttf",
 
   "transicoes_video": ["crossfade", "flash", "shadow_wipe"],
   "usar_prints_noticia": true,
@@ -74,6 +76,20 @@
   "correcoes_pronuncia": {
     "eua": "estados unidos"
   },
+  "telegram_review": {
+    "ativo": true,
+    "timeout_resposta_min": 30
+  },
+  "selecao_tema_telegram": {
+    "ativo": true,
+    "timeout_resposta_min": 40
+  },
+  "destaques_telegram": {
+    "ativo": true,
+    "timeout_resposta_min": 40
+  },
+  "max_destaques_por_bloco": 1,
+  "volume_musica_fundo": 0.10,
 
   "idioma_conteudo": "português do Brasil",
   "idioma_whisper": "pt",

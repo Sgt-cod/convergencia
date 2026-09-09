@@ -235,12 +235,17 @@ capítulo trata de um fato concreto, não é exceção rara.
 BLOCOS:
 {blocos_prompt}
 
-Para cada bloco escolhido, escreva uma manchete curta (até 10 palavras, estilo jornal,
-em CAIXA ALTA) e um subtítulo de uma frase — baseados SÓ no que o bloco já diz, sem
-inventar fatos novos.
+Para cada bloco escolhido, escreva:
+- "manchete": título curto (até 12 palavras, estilo jornal), pode usar maiúscula só na
+  primeira palavra e em nomes próprios (não precisa ser tudo em caixa alta)
+- "corpo": um parágrafo de 3 a 4 frases (35-55 palavras), no estilo de matéria de
+  jornal, baseado SÓ no que o bloco já diz, sem inventar fato novo
+- "trecho_destaque": um trecho de 6 a 14 palavras que aparece LITERALMENTE dentro do
+  "corpo" acima (cópia exata, mesma pontuação) — a frase mais impactante/citável dele,
+  que vai aparecer destacada em vermelho no design
 
 Retorne APENAS JSON:
-{{"escolhidos": [{{"indice": 0, "manchete": "...", "subtitulo": "..."}}]}}
+{{"escolhidos": [{{"indice": 0, "manchete": "...", "corpo": "...", "trecho_destaque": "..."}}]}}
 Se nenhum bloco se encaixar (ex: todos são só reflexão/opinião), retorne {{"escolhidos": []}}."""
 
     try:
@@ -252,10 +257,21 @@ Se nenhum bloco se encaixar (ex: todos são só reflexão/opinião), retorne {{"
 
     for item in escolhidos:
         i = item.get('indice')
-        if isinstance(i, int) and 0 <= i < len(blocos_com_tempo) and item.get('manchete'):
+        corpo = (item.get('corpo') or '').strip()
+        if isinstance(i, int) and 0 <= i < len(blocos_com_tempo) and item.get('manchete') and corpo:
+            trecho_destaque = (item.get('trecho_destaque') or '').strip()
+            # Se o Gemini não copiou o trecho literalmente (aconteceu, principalmente
+            # com pontuação diferente), simplesmente não destaca nada — melhor um print
+            # sem trecho em vermelho do que gerar_print_noticia tentando achar uma
+            # substring que não existe e quebrando o destaque visual no meio da imagem.
+            if trecho_destaque and trecho_destaque.lower() not in corpo.lower():
+                print(f"    ⚠️ 'trecho_destaque' do bloco {i} não bate literalmente com "
+                      f"'corpo' — seguindo sem destaque em vermelho pra esse print")
+                trecho_destaque = ""
             blocos_com_tempo[i]['usa_print_noticia'] = True
             blocos_com_tempo[i]['manchete_noticia'] = item['manchete'].strip()
-            blocos_com_tempo[i]['subtitulo_noticia'] = (item.get('subtitulo') or '').strip()
+            blocos_com_tempo[i]['corpo_noticia'] = corpo
+            blocos_com_tempo[i]['trecho_destaque_noticia'] = trecho_destaque
 
     if escolhidos:
         print(f"  📰 {len(escolhidos)} bloco(s) vão usar print de notícia")
@@ -299,6 +315,36 @@ Retorne APENAS JSON, uma lista por bloco, MESMA ORDEM E QUANTIDADE dos blocos ac
     while len(listas) < len(blocos_com_tempo):
         listas.append([])
     return listas[:len(blocos_com_tempo)]
+
+
+def mapear_destaques_manuais_para_blocos(blocos_com_tempo, frases):
+    """
+    Converte uma lista PLANA de frases (vindas da escolha manual no Telegram) na mesma
+    estrutura que escolher_palavras_destaque() devolve — uma lista de listas, uma por
+    bloco — pra poder substituir a escolha automática do Gemini sem mexer no resto do
+    pipeline (resolver_destaques_com_tempo não sabe, nem precisa saber, se a frase veio
+    do Gemini ou de um humano).
+
+    Cada frase só entra no PRIMEIRO bloco onde aparece literalmente (case-insensitive)
+    — se não aparecer em nenhum, é ignorada e avisada no log, porque destacar um trecho
+    que não existe no texto/timestamp real quebraria resolver_destaques_com_tempo mais
+    na frente.
+    """
+    resultado = [[] for _ in blocos_com_tempo]
+    for frase in frases:
+        frase_limpa = frase.strip()
+        if not frase_limpa:
+            continue
+        achou = False
+        for i, b in enumerate(blocos_com_tempo):
+            if frase_limpa.lower() in b['texto'].lower():
+                resultado[i].append(frase_limpa)
+                achou = True
+                break
+        if not achou:
+            print(f"    ⚠️ Destaque manual '{frase_limpa}' não encontrado literalmente "
+                  f"no roteiro deste segmento — ignorado")
+    return resultado
 
 
 def _encontrar_subsequencia(lista, alvo):

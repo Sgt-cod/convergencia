@@ -16,6 +16,12 @@ Chaves opcionais — se ausentes, o pipeline usa o comportamento antigo (nada qu
 | `modo_roteiro` | `"cadeia_completa"` (tese/objeção), `"simples"` (devocional) ou **`"capitulos_webdoc"`** (formato investigativo em capítulos, tipo Elementar — ver seção abaixo) | `"cadeia_completa"` |
 | `num_capitulos_webdoc` | Quantos capítulos gerar no modo `capitulos_webdoc` | `3` |
 | `duracao_card_capitulo` | Segundos que o card preto de transição fica na tela | `2.2` |
+| `fonte_thumbnail_arquivo` | Caminho de um `.ttf` (ex: `"assets/fonts/MinhaFonte-Bold.ttf"`) pro texto da thumbnail | fonte padrão do sistema |
+| `fonte_print_noticia_headline_arquivo` | Caminho de um `.ttf` pra manchete do print de notícia | fonte padrão do sistema |
+| `fonte_print_noticia_corpo_arquivo` | Caminho de um `.ttf` pro corpo do print de notícia | fonte padrão do sistema |
+| `fonte_destaque_arquivo` | Caminho de um `.ttf` pra palavra-destaque (o "grito" que aparece por cima do B-roll) | mesma fonte da legenda |
+| `volume_musica_fundo` | Volume da música de fundo em relação à narração (`0.06` = 6%). Suba pra deixar mais alta — `0.12` já é bem perceptível | `0.06` |
+| `max_destaques_por_bloco` | Quantas expressões de destaque o Gemini pode escolher, no máximo, por bloco de roteiro. Baixe pra `1` se estiver muito frequente | `2` |
 
 ## Modo webdoc em capítulos (`modo_roteiro: "capitulos_webdoc"`)
 
@@ -42,6 +48,60 @@ Como funciona por baixo (sem exigir nenhuma mudança no pipeline de TTS/áudio):
   sistema distribui uma por capítulo automaticamente.
 
 Sem essa chave no `config.json` (ou com o modo padrão), nada muda — é 100% opt-in.
+
+
+## Revisão de mídia e escolha de tema via Telegram (telegram_review.py)
+
+Camada opcional de interação humana no meio do workflow, via bot do Telegram (sem
+lib de bot — só `requests` puro contra a Bot API).
+
+**Secrets/env vars necessários** (ex: GitHub Actions → Settings → Secrets):
+
+| Variável | Onde conseguir |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Fale com [@BotFather](https://t.me/BotFather) no Telegram, `/newbot`, copie o token |
+| `TELEGRAM_CHAT_ID` | Mande qualquer mensagem pro bot recém-criado, depois abra `https://api.telegram.org/bot<TOKEN>/getUpdates` no navegador — pegue o `"chat":{"id": ...}` |
+
+Sem as duas variáveis setadas, todo o módulo vira no-op — o pipeline roda 100%
+automático, igual antes. Com as duas setadas, ative cada recurso separadamente no
+`config.json`:
+
+```json
+{
+  "telegram_review": { "ativo": true, "timeout_resposta_min": 30 },
+  "selecao_tema_telegram": { "ativo": true, "timeout_resposta_min": 10 }
+}
+```
+
+- **`telegram_review`**: pra CADA clipe de B-roll de CADA segmento (introdução,
+  capítulo, desfecho), o bot manda a mídia + o trecho exato do roteiro narrado
+  naquele clipe, com botões **✅ Aprovar** / **❌ Recusar**. Recusar oferece
+  **🚫 Cancelar workflow** (nenhum vídeo é publicado — a run termina com sucesso,
+  não como falha) ou **📤 Enviar mídia**: responda com um link de `pexels.com/video/...`
+  ou `pexels.com/photo/...` (baixa aquele item específico) ou mande a foto/vídeo
+  direto do celular. Sem resposta dentro do timeout, o clipe é aprovado
+  automaticamente (não trava o pipeline indefinidamente).
+- **`selecao_tema_telegram`**: no início do workflow, o bot pergunta o tema/
+  direcionamento do próximo vídeo (não precisa ser o título — pode ser só o ângulo,
+  ex: *"a máfia dos carros-pipa"*) com um botão **🤖 Nada a sugerir**. Responder com
+  texto vira o direcionamento; botão ou timeout cai pra escolha automática de sempre
+  (`escolher_tema_reflexao()`, dentro dos temas configurados).
+- **`destaques_telegram`**: em vez do Gemini escolher sozinho quais palavras
+  destacar (`escolher_palavras_destaque`), o bot manda o roteiro inteiro do segmento e
+  pergunta quais expressões destacar, com botão **🤖 Automático**. Responda com uma
+  expressão por linha, **exatamente como está escrita no texto mandado** — se não
+  bater literalmente, aquela linha é ignorada (avisado no log) em vez de quebrar o
+  vídeo. Ative junto com `max_destaques_por_bloco: 1` se quiser controle fino e baixa
+  frequência ao mesmo tempo.
+
+⚠️ Ambos os fluxos são bloqueantes (esperam sua resposta) — se o timeout configurado
+for maior que o timeout do job/runner, o job morre no meio da espera. Ajuste
+`timeout_resposta_min` de acordo.
+
+⚠️ Recorte mais assertivo (7-13s por clipe, em vez de 20-25s): ajustável via
+`DURACAO_MINIMA_CLIPE`/`DURACAO_MAXIMA_CLIPE` (env var), e o timestamp de palavra usado
+pra cortar cada bloco agora vem do Whisper `small` (era `base`) com `vad_filter`
+ligado — mais preciso, principalmente em português.
 
 
 ## Fontes de dados públicas (fonte_dados.py)

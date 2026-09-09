@@ -26,9 +26,14 @@ from producao_visual import (
     resolver_destaques_com_tempo,
     construir_timeline_sfx,
     decidir_prints_de_noticia,
+    mapear_destaques_manuais_para_blocos,
 )
 from transicoes import TRANSICOES_DISPONIVEIS, transicao_crossfade
 from mockups_visuais import gerar_print_noticia
+from telegram_review import (
+    ATIVA_TELEGRAM, revisar_midia_pipeline, escolher_tema_telegram,
+    escolher_destaques_telegram, WorkflowCanceladoPeloUsuario,
+)
 
 # ============================================================
 # Curadoria via Telegram (opcional)
@@ -95,10 +100,14 @@ SEGUNDOS_LEAD_IN_SEGMENTO = float(os.environ.get(
 SEGUNDOS_TAIL_SEGMENTO = float(os.environ.get(
     'SEGUNDOS_TAIL_SEGMENTO', '3'))       # mídia muda depois da narração do segmento terminar
 
-# ── Duração máxima por clipe do Pexels ───────────────────────────────────────
-# Evita que um único vídeo longo (ex: 2min) preencha o short inteiro sozinho.
-# Ajuste entre 15 e 30 conforme preferir mais ou menos variedade de cortes.
-DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '14'))  # dinamismo: nada fica mais que isso na tela
+# ── Duração de cada clipe de B-roll (Pexels/Wikimedia/Internet Archive) ─────
+# Faixa alvo pedida pra revisão assertiva no Telegram (ver telegram_review.py): cortes
+# curtos e alinhados ao roteiro, não um vídeo de 20-25s carregando o segmento inteiro.
+# DURACAO_MAXIMA_CLIPE é o teto de cada clipe individual; DURACAO_MINIMA_CLIPE evita
+# que sobre um resto minúsculo (ex: 2s) no fim de um bloco — esse resto é somado ao
+# clipe anterior em vez de virar um corte novo abaixo do mínimo.
+DURACAO_MAXIMA_CLIPE = float(os.environ.get('DURACAO_MAXIMA_CLIPE', '13'))
+DURACAO_MINIMA_CLIPE = float(os.environ.get('DURACAO_MINIMA_CLIPE', '7'))
 # Teto de quanto tempo um print de notícia fica sozinho na tela — o resto do bloco
 # (se a narração daquele trecho for mais longa que isso) cai pro B-roll normal.
 
@@ -156,7 +165,6 @@ LEGENDA_FONTE = os.environ.get('LEGENDA_FONTE', config.get('fonte_legenda_nome',
 COR_DESTAQUE = os.environ.get('COR_DESTAQUE', config.get('cor_destaque', '#FFD24D'))  # Fase 2: texto de destaque
 FONTE_DESTAQUE = os.environ.get('FONTE_DESTAQUE', config.get('fonte_destaque_arquivo', config.get('fonte_destaque_nome', LEGENDA_FONTE)))
 DURACAO_POP_DESTAQUE = float(os.environ.get('DURACAO_POP_DESTAQUE', '0.18'))  # tempo do "estalo" de entrada
-
 # Tamanho da palavra-destaque: por padrão é largura_do_video / DESTAQUE_TAMANHO_DIVISOR
 # (divisor maior = texto menor). Ajustável em config.json ('fonte_destaque_divisor') sem
 # mexer em código — ex: 6 deixa bem maior que o padrão (10), 14 deixa bem menor.
@@ -169,9 +177,21 @@ DESTAQUE_TAMANHO_DIVISOR = float(os.environ.get(
 # largura do vídeo — deixe null/ausente em config.json pra usar o divisor acima.
 DESTAQUE_TAMANHO_PX = config.get('fonte_destaque_tamanho_px')
 
+# Quantas expressões de destaque por bloco o Gemini pode escolher automaticamente
+# (escolher_palavras_destaque, em producao_visual.py) — baixe pra 1 se estiver
+# aparecendo destaque com muita frequência. Sem efeito quando a escolha é manual via
+# Telegram (ver 'destaques_telegram' abaixo, e telegram_review.escolher_destaques_telegram).
+MAX_DESTAQUES_POR_BLOCO = int(config.get('max_destaques_por_bloco', 2))
+
 # Fonte da thumbnail: caminho direto do arquivo .ttf no repositório (PIL carrega o arquivo
 # diretamente, não precisa estar instalada no sistema).
 FONTE_THUMBNAIL_ARQUIVO = config.get('fonte_thumbnail_arquivo', '')
+
+# Volume da música de fundo em relação à narração (0.06 = 6% do volume da narração,
+# que fica em 1.0). Suba pra deixar a música mais alta — ex: 0.12 já é bem perceptível,
+# cuidado pra não competir com a voz. Configurável só no config.json (não tem env var
+# própria porque afeta os 3 pontos de mixagem — curto/longo/segmento — juntos).
+VOLUME_MUSICA_FUNDO = float(config.get('volume_musica_fundo', 0.06))
 
 
 # ============================================================
@@ -510,14 +530,21 @@ def criar_audio(texto, output_file):
 # ============================================================
 
 _whisper_model = None
+# BUGFIX (mídia de 20-25s em vez de 7-13s — timestamp pouco assertivo): o modelo
+# "base" é o menor do faster-whisper e erra mais a fronteira exata de cada palavra em
+# português, especialmente em trechos rápidos ou com pausa curta — isso deixava o corte
+# de B-roll por bloco (que usa esses timestamps pra fatiar o tempo) impreciso. "small"
+# é o próximo degrau: ainda roda bem em CPU, mas com alinhamento de palavra bem mais
+# fiel. Configurável via env var pra quem quiser trocar de novo sem editar código.
+WHISPER_MODEL_SIZE = os.environ.get('WHISPER_MODEL_SIZE', 'small')
 
 
 def _carregar_whisper():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        print("🧠 Carregando modelo Whisper (base, CPU) para legendas...")
-        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        print(f"🧠 Carregando modelo Whisper ({WHISPER_MODEL_SIZE}, CPU) para legendas...")
+        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -529,7 +556,12 @@ def transcrever_palavras_com_timestamps(audio_path):
     """
     whisper_model = _carregar_whisper()
     idioma_whisper = config.get('idioma_whisper', 'pt')
-    segments, _info = whisper_model.transcribe(audio_path, language=idioma_whisper, word_timestamps=True)
+    # vad_filter=True: remove trechos de silêncio/ruído antes de alinhar — evita que uma
+    # pausa longa "puxe" o fim de uma palavra pra mais longe do que ela realmente durou,
+    # o que é a causa mais comum de timestamp de palavra impreciso no faster-whisper.
+    segments, _info = whisper_model.transcribe(
+        audio_path, language=idioma_whisper, word_timestamps=True, vad_filter=True,
+    )
 
     palavras_tempo = []
     for seg in segments:
@@ -881,6 +913,12 @@ def baixar_clipes_pexels(termo, orientacao, duracao_alvo, offset_inicio=0.0):
 
             duracao_disponivel = video.get('duration', 6)
             duracao_uso = min(duracao_disponivel, DURACAO_MAXIMA_CLIPE, duracao_alvo - tempo_coberto)
+            # Se sobrar um resto menor que DURACAO_MINIMA_CLIPE depois deste clipe, e o
+            # arquivo baixado tiver fôlego pra cobrir isso também, absorve o resto aqui em
+            # vez de deixar um corte novo abaixo do mínimo pedido (7-13s) no próximo passo.
+            resto_apos = (duracao_alvo - tempo_coberto) - duracao_uso
+            if 0 < resto_apos < DURACAO_MINIMA_CLIPE:
+                duracao_uso = min(duracao_disponivel, duracao_uso + resto_apos)
 
             clipes.append({'path': destino, 'inicio': offset_inicio + tempo_coberto, 'duracao': duracao_uso})
             tempo_coberto += duracao_uso
@@ -961,7 +999,10 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                 duracao_print = min(duracao_alvo, DURACAO_MAXIMA_PRINT_NOTICIA)
                 caminho_print = gerar_print_noticia(
                     manchete=bloco['manchete_noticia'],
-                    subtitulo=bloco.get('subtitulo_noticia'),
+                    corpo=bloco.get('corpo_noticia'),
+                    trecho_destaque=bloco.get('trecho_destaque_noticia'),
+                    fonte_headline_arquivo=config.get('fonte_print_noticia_headline_arquivo'),
+                    fonte_corpo_arquivo=config.get('fonte_print_noticia_corpo_arquivo'),
                     output_path=f"{ASSETS_DIR}/prints/bloco_{i}.png",
                 )
                 todos_os_clipes.append({
@@ -1068,6 +1109,11 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                           f"pra não deixar vão preto na transição")
                     duracao_disponivel = duracao_real
                 duracao_uso = min(duracao_disponivel, DURACAO_MAXIMA_CLIPE, duracao_alvo - tempo_coberto)
+                # Mesma lógica de baixar_clipes_pexels: absorve resto < DURACAO_MINIMA_CLIPE
+                # no clipe atual em vez de gerar um corte novo abaixo da faixa alvo (7-13s).
+                resto_apos = (duracao_alvo - tempo_coberto) - duracao_uso
+                if 0 < resto_apos < DURACAO_MINIMA_CLIPE:
+                    duracao_uso = min(duracao_disponivel, duracao_uso + resto_apos)
 
                 todos_os_clipes.append({
                     'path': destino,
@@ -1535,7 +1581,7 @@ def criar_video_curto(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     audio_narr = AudioFileClip(audio_path).set_start(SEGUNDOS_LEAD_IN)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=SEGUNDOS_LEAD_IN)
-    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=0.06)
+    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=VOLUME_MUSICA_FUNDO)
     audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
 
     video_final = video_base.set_audio(audio_final)
@@ -1628,7 +1674,7 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     audio_narr = AudioFileClip(audio_path).set_start(offset_narracao)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=offset_narracao)
-    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=0.06)
+    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=VOLUME_MUSICA_FUNDO)
     audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
 
     video_final = video_base.set_audio(audio_final)
@@ -1710,7 +1756,15 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
         )
         lista_clipes = baixar_clipes_por_bloco(blocos_com_tempo_local, orientacao)
 
-        destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo_local, _gemini_generate)
+        destaques_manuais = None
+        if ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
+            destaques_manuais = escolher_destaques_telegram(texto_segmento, nome_segmento)
+
+        if destaques_manuais is not None:
+            destaques_por_bloco = mapear_destaques_manuais_para_blocos(blocos_com_tempo_local, destaques_manuais)
+        else:
+            destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo_local, _gemini_generate,
+                                                               max_por_bloco=MAX_DESTAQUES_POR_BLOCO)
         destaques_resolvidos = resolver_destaques_com_tempo(
             texto_segmento, palavras_tempo, blocos_com_tempo_local, destaques_por_bloco
         )
@@ -1725,6 +1779,10 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
 
     if not lista_clipes:
         raise RuntimeError(f"Nenhum clipe de B-roll baixado pro segmento '{nome_segmento}'")
+
+    if ATIVA_TELEGRAM and config.get('telegram_review', {}).get('ativo', False):
+        lista_clipes = revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo,
+                                               nome_segmento)
 
     # duracao_segmento até aqui é a duração PURA da narração (0s = 1ª palavra falada,
     # fim = última palavra). lista_clipes/clips_legenda/clips_destaque/eventos_sfx
@@ -1772,7 +1830,7 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
 
     audio_narr = AudioFileClip(audio_path_seg).set_start(padding_inicio)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx, offset=padding_inicio)
-    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_segmento, volume=0.06)
+    audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_segmento, volume=VOLUME_MUSICA_FUNDO)
 
     # Trava o fade pra nunca ultrapassar o padding mudo correspondente — mesmo que
     # 'duracao_fade_conteudo' no config.json seja maior que o padding, o fade não pode
@@ -2442,7 +2500,11 @@ def main():
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     os.makedirs(ASSETS_DIR, exist_ok=True)
 
-    tema = escolher_tema_reflexao()
+    tema = None
+    if ATIVA_TELEGRAM and config.get('selecao_tema_telegram', {}).get('ativo', False):
+        tema = escolher_tema_telegram()  # None = usuário pediu automático (ou timeout)
+    if not tema:
+        tema = escolher_tema_reflexao()
 
     print("✍️ Gerando roteiro (cadeia: tese → estrutura → escrita → crítica → título/descrição)...")
     pacote_roteiro = gerar_pacote_roteiro(
@@ -2580,7 +2642,8 @@ def main():
             lista_clipes = baixar_clipes_por_bloco(blocos_com_tempo, orientacao)
 
             print("✨ Escolhendo palavras de destaque...")
-            destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo, _gemini_generate)
+            destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo, _gemini_generate,
+                                                               max_por_bloco=MAX_DESTAQUES_POR_BLOCO)
             destaques_resolvidos = resolver_destaques_com_tempo(
                 roteiro, palavras_tempo, blocos_com_tempo, destaques_por_bloco
             )
@@ -2694,4 +2757,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except WorkflowCanceladoPeloUsuario as e:
+        # Cancelamento voluntário via Telegram (revisar_midia_pipeline) — não é uma
+        # falha do pipeline, então sai com código 0 (sucesso) pra não marcar a run do
+        # GitHub Actions como falha por uma decisão manual de não publicar.
+        print(f"🚫 Workflow interrompido pelo usuário: {e}")

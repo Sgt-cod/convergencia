@@ -51,7 +51,7 @@ jobs:
           FISHAUDIO_API_KEY: ${{ secrets.FISHAUDIO_API_KEY }}
           FISHAUDIO_VOICE_ID: ${{ secrets.FISHAUDIO_VOICE_ID }}
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
-          USAR_CURACAO: "false"
+          USAR_CURACAO: "true"
           VIDEO_TYPE: long
           # ── Descomente pra testar sem publicar / mais rápido ──────────────
           # PULAR_UPLOAD: "true"

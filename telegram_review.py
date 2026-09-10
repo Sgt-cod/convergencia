@@ -137,6 +137,51 @@ def enviar_midia(caminho, legenda, botoes=None):
 _offset_updates = None
 _offset_inicializado = False
 
+# BUGFIX (mídia trocada/perdida/vazando pra outro segmento): antes, cada função de
+# espera (aguardar_callback / aguardar_midia_ou_texto) só reconhecia o TIPO de resposta
+# que ela mesma esperava naquele instante — um clique de botão OU uma mídia, nunca os
+# dois, e só se chegasse durante a janela exata em que aquela função estava rodando.
+# Qualquer mensagem que chegasse "fora de hora" (ex: usuário manda a foto de
+# substituição antes de clicar Recusar→Enviar mídia, ou manda o próximo link enquanto
+# o bot ainda está processando o clipe anterior) era descartada pra sempre — o
+# getUpdates do Telegram não devolve a mesma mensagem duas vezes depois que o offset
+# passa por ela. Isso é o que causava clipe pulado, ordem trocada, e mídia de um
+# segmento vazando pro próximo (a mensagem "atrasada" ficava pendente e era capturada
+# pelo primeiro aguardar_... do segmento SEGUINTE).
+#
+# A correção: TODA atualização que chega é imediatamente classificada e guardada numa
+# fila (callback ou mensagem) — nunca descartada. Cada função de espera primeiro olha
+# se já tem algo pendente na fila certa antes de fazer long-polling por algo novo. Isso
+# também permite mandar tudo em sequência sem esperar o bot perguntar de novo a cada
+# clipe (que é como a maioria das pessoas natural mente usa isso).
+_fila_callbacks = []
+_fila_mensagens = []
+
+
+def _pasta_downloads_padrao():
+    d = os.path.join('assets', 'telegram_review')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def limpar_filas_pendentes():
+    """Descarta (com aviso) qualquer callback/mensagem que tenha sobrado sem ser
+    consumido no passo anterior. Chamado no INÍCIO da revisão de CADA segmento — é o
+    que impede uma resposta atrasada do segmento anterior de vazar pro de agora."""
+    global _fila_callbacks, _fila_mensagens
+    if _fila_callbacks or _fila_mensagens:
+        aviso = (f"🧹 Descartando {len(_fila_callbacks)} clique(s) e "
+                 f"{len(_fila_mensagens)} mensagem(ns) que sobraram sem uso do "
+                 f"segmento anterior (chegaram atrasadas — se era uma mídia pra um "
+                 f"clipe específico, manda de novo quando eu pedir).")
+        print(f"  {aviso}")
+        try:
+            enviar_texto(aviso)
+        except Exception:
+            pass
+    _fila_callbacks = []
+    _fila_mensagens = []
+
 
 def _descartar_atualizacoes_antigas():
     """Roda uma vez, na primeira chamada de qualquer fluxo — drena updates pendentes
@@ -157,6 +202,10 @@ def _descartar_atualizacoes_antigas():
 
 
 def _proximos_updates(timeout_long_poll=25):
+    """Busca updates novos do Telegram e devolve a lista crua — usado só por
+    escolher_tema_telegram/escolher_destaques_telegram, que têm laços próprios (não
+    passam pelas filas _fila_callbacks/_fila_mensagens porque rodam ANTES/fora do
+    laço de revisão de clipe a clipe, sem risco de mistura entre clipes)."""
     global _offset_updates
     _descartar_atualizacoes_antigas()
     params = {'timeout': timeout_long_poll}
@@ -173,51 +222,87 @@ def _proximos_updates(timeout_long_poll=25):
     return updates
 
 
+def _classificar_update(upd):
+    """Devolve ('callback', data) ou ('mensagem', dict) ou None — NUNCA descarta um
+    update reconhecível, só ignora update de outro chat/tipo que não interessa (ex:
+    edited_message, my_chat_member)."""
+    cq = upd.get('callback_query')
+    if cq and str(cq.get('message', {}).get('chat', {}).get('id')) == str(TELEGRAM_CHAT_ID):
+        try:
+            _chamar('answerCallbackQuery', callback_query_id=cq['id'])
+        except Exception:
+            pass
+        return ('callback', cq.get('data'))
+
+    msg = upd.get('message')
+    if not msg or str(msg.get('chat', {}).get('id')) != str(TELEGRAM_CHAT_ID):
+        return None
+
+    if msg.get('photo'):
+        maior = max(msg['photo'], key=lambda p: p.get('file_size', 0))
+        caminho = _baixar_arquivo_telegram(maior['file_id'], _pasta_downloads_padrao(), '.jpg')
+        return ('mensagem', {'tipo': 'foto', 'caminho': caminho, 'texto': None})
+    if msg.get('video'):
+        caminho = _baixar_arquivo_telegram(msg['video']['file_id'], _pasta_downloads_padrao(), '.mp4')
+        return ('mensagem', {'tipo': 'video', 'caminho': caminho, 'texto': None})
+    if msg.get('document'):
+        nome = msg['document'].get('file_name', 'arquivo')
+        ext = os.path.splitext(nome)[1].lower() or '.bin'
+        caminho = _baixar_arquivo_telegram(msg['document']['file_id'], _pasta_downloads_padrao(), ext)
+        return ('mensagem', {'tipo': 'documento', 'caminho': caminho, 'texto': None})
+    if msg.get('text'):
+        return ('mensagem', {'tipo': 'texto', 'caminho': None, 'texto': msg['text'].strip()})
+    return None
+
+
+def _drenar_para_filas(timeout_long_poll=25):
+    """Busca updates novos e empilha CADA UM na fila certa (_fila_callbacks ou
+    _fila_mensagens) — a peça central do bugfix: nada é descartado só porque quem
+    chamou não é quem esperava por aquele tipo específico de resposta."""
+    for upd in _proximos_updates(timeout_long_poll=timeout_long_poll):
+        classificado = _classificar_update(upd)
+        if not classificado:
+            continue
+        tipo, valor = classificado
+        (_fila_callbacks if tipo == 'callback' else _fila_mensagens).append(valor)
+
+
 def aguardar_callback(timeout_s=1800):
-    """Espera (long-polling) o usuário apertar um botão inline. Retorna o callback_data
-    (string) ou None no timeout — quem chama decide o que fazer (normalmente: seguir
-    com um valor padrão em vez de travar o pipeline pra sempre)."""
+    """Espera o usuário apertar um botão inline. Olha a fila ANTES de fazer
+    long-polling — se o clique já tinha chegado (ex: enquanto processava o clipe
+    anterior), pega ele na hora em vez de esperar de novo. Retorna None no timeout."""
     limite = time.time() + timeout_s
     while time.time() < limite:
-        for upd in _proximos_updates(timeout_long_poll=25):
-            cq = upd.get('callback_query')
-            if cq and str(cq.get('message', {}).get('chat', {}).get('id')) == str(TELEGRAM_CHAT_ID):
-                try:
-                    _chamar('answerCallbackQuery', callback_query_id=cq['id'])
-                except Exception:
-                    pass
-                return cq.get('data')
+        if _fila_callbacks:
+            return _fila_callbacks.pop(0)
+        _drenar_para_filas(timeout_long_poll=25)
     return None
 
 
 def aguardar_midia_ou_texto(timeout_s=1800, download_dir=None):
-    """Espera a PRÓXIMA mensagem (não-callback) do usuário: foto, vídeo, documento ou
-    texto puro. Retorna {'tipo': 'foto'|'video'|'documento'|'texto', 'caminho': str|None,
-    'texto': str|None}, ou None no timeout."""
-    download_dir = download_dir or os.path.join('assets', 'telegram_review')
-    os.makedirs(download_dir, exist_ok=True)
+    """Espera a PRÓXIMA mensagem (não-callback): foto, vídeo, documento ou texto.
+    Mesma lógica de fila-primeiro de aguardar_callback. Retorna None no timeout."""
     limite = time.time() + timeout_s
     while time.time() < limite:
-        for upd in _proximos_updates(timeout_long_poll=25):
-            msg = upd.get('message')
-            if not msg or str(msg.get('chat', {}).get('id')) != str(TELEGRAM_CHAT_ID):
-                continue
-
-            if msg.get('photo'):
-                maior = max(msg['photo'], key=lambda p: p.get('file_size', 0))
-                caminho = _baixar_arquivo_telegram(maior['file_id'], download_dir, '.jpg')
-                return {'tipo': 'foto', 'caminho': caminho, 'texto': None}
-            if msg.get('video'):
-                caminho = _baixar_arquivo_telegram(msg['video']['file_id'], download_dir, '.mp4')
-                return {'tipo': 'video', 'caminho': caminho, 'texto': None}
-            if msg.get('document'):
-                nome = msg['document'].get('file_name', 'arquivo')
-                ext = os.path.splitext(nome)[1].lower() or '.bin'
-                caminho = _baixar_arquivo_telegram(msg['document']['file_id'], download_dir, ext)
-                return {'tipo': 'documento', 'caminho': caminho, 'texto': None}
-            if msg.get('text'):
-                return {'tipo': 'texto', 'caminho': None, 'texto': msg['text'].strip()}
+        if _fila_mensagens:
+            return _fila_mensagens.pop(0)
+        _drenar_para_filas(timeout_long_poll=25)
     return None
+
+
+def _aguardar_callback_ou_midia(timeout_s=1800):
+    """Espera OU um clique de botão OU uma mídia/texto direto — o que chegar primeiro.
+    É isso que permite responder um clipe SEM precisar clicar Recusar→Enviar mídia:
+    manda a foto/link direto que já vale como substituição. Retorna (None, None) no
+    timeout, ('callback', data) ou ('mensagem', dict)."""
+    limite = time.time() + timeout_s
+    while time.time() < limite:
+        if _fila_callbacks:
+            return ('callback', _fila_callbacks.pop(0))
+        if _fila_mensagens:
+            return ('mensagem', _fila_mensagens.pop(0))
+        _drenar_para_filas(timeout_long_poll=25)
+    return (None, None)
 
 
 def _baixar_arquivo_telegram(file_id, download_dir, extensao):
@@ -319,6 +404,13 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
     formato bruto [{'path','inicio','duracao',...}], tempo relativo ao início da
     narração do segmento (mesmo referencial de texto_segmento/palavras_tempo).
 
+    Cada clipe pode ser respondido de DOIS jeitos, sem precisar escolher um só:
+      - clicando ✅ Aprovar / ❌ Recusar
+      - mandando a substituição DIRETO (link do Pexels ou foto/vídeo do aparelho),
+        sem precisar clicar em nada antes — vale como "recusar + já aqui está a mídia"
+    Isso deixa mandar tudo em sequência rápida (como a maioria das pessoas naturalmente
+    faz) sem precisar esperar o bot reperguntar a cada clipe.
+
     Devolve a MESMA lista, com 'path' trocado nos clipes que foram substituídos.
     Levanta WorkflowCanceladoPeloUsuario se o usuário cancelar.
     """
@@ -326,11 +418,18 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
         return lista_clipes
 
     timeout_min = _timeout_min('telegram_review', 30)
+    # BUGFIX: nunca herdar uma mensagem/callback que sobrou sem uso de um segmento ou
+    # clipe anterior — impede vazamento tipo "mídia mandada pra um clipe da introdução
+    # aparecendo no capítulo 1".
+    limpar_filas_pendentes()
+
     print(f"  📲 Revisão de mídia via Telegram — segmento '{nome_segmento}' "
           f"({len(lista_clipes)} clipe(s), timeout {timeout_min} min/resposta)...")
 
     enviar_texto(f"🎬 Revisão de mídia — segmento \"{nome_segmento}\"\n"
-                 f"{len(lista_clipes)} clipe(s) pra aprovar, um de cada vez.")
+                 f"{len(lista_clipes)} clipe(s) pra aprovar, um de cada vez. Pode "
+                 f"aprovar/recusar pelos botões OU já mandar a substituição direto "
+                 f"(link do Pexels ou foto/vídeo do aparelho) que eu entendo.")
 
     for i, clipe in enumerate(lista_clipes):
         trecho = _trecho_do_roteiro(texto_segmento, palavras_tempo,
@@ -340,45 +439,55 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
 
         enviar_midia(clipe['path'], legenda,
                      botoes=[('✅ Aprovar', 'aprovar'), ('❌ Recusar', 'recusar')])
-        resposta = aguardar_callback(timeout_s=timeout_min * 60)
 
-        if resposta is None:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+
+        if tipo is None:
             print(f"    ⏱️ Sem resposta em {timeout_min} min pro clipe {i + 1} — "
                   f"aprovando automaticamente pra não travar o pipeline")
             continue
-        if resposta == 'aprovar':
+
+        if tipo == 'callback' and valor == 'aprovar':
             continue
 
-        # 'recusar' → oferece cancelar ou substituir, em loop até resolver ou desistir
-        while True:
-            enviar_texto("O que fazer com esse clipe?",
-                         botoes=[('🚫 Cancelar workflow', 'cancelar'), ('📤 Enviar mídia', 'enviar')])
-            escolha = aguardar_callback(timeout_s=timeout_min * 60)
+        novo_caminho = None
 
-            if escolha is None or escolha == 'cancelar':
-                enviar_texto("🚫 Workflow cancelado. Nenhum vídeo será publicado.")
-                raise WorkflowCanceladoPeloUsuario(
-                    f"Cancelado pelo usuário no clipe {i + 1} do segmento '{nome_segmento}'")
+        if tipo == 'mensagem':
+            # usuário já mandou a substituição direto, sem clicar em nada
+            novo_caminho = (_baixar_pexels_por_id(valor['texto']) if valor['tipo'] == 'texto'
+                             else valor['caminho'])
+            if not novo_caminho:
+                enviar_texto(f"⚠️ Não consegui usar essa mídia pro clipe {i + 1} — "
+                             f"mantendo o clipe original.")
 
-            enviar_texto("Manda o link do Pexels (pexels.com/video/... ou /photo/...) "
-                         "ou envie a foto/vídeo direto daqui.")
-            recebido = aguardar_midia_ou_texto(timeout_s=timeout_min * 60)
+        else:  # tipo == 'callback' e valor == 'recusar' → fluxo explícito de botões
+            while novo_caminho is None:
+                enviar_texto("O que fazer com esse clipe?",
+                             botoes=[('🚫 Cancelar workflow', 'cancelar'), ('📤 Enviar mídia', 'enviar')])
+                escolha = aguardar_callback(timeout_s=timeout_min * 60)
 
-            if recebido is None:
-                enviar_texto(f"⏱️ Sem resposta em {timeout_min} min — mantendo o clipe original.")
-                break
+                if escolha is None or escolha == 'cancelar':
+                    enviar_texto("🚫 Workflow cancelado. Nenhum vídeo será publicado.")
+                    raise WorkflowCanceladoPeloUsuario(
+                        f"Cancelado pelo usuário no clipe {i + 1} do segmento '{nome_segmento}'")
 
-            novo_caminho = (_baixar_pexels_por_id(recebido['texto'])
-                             if recebido['tipo'] == 'texto' else recebido['caminho'])
+                enviar_texto("Manda o link do Pexels (pexels.com/video/... ou /photo/...) "
+                             "ou envie a foto/vídeo direto daqui.")
+                recebido = aguardar_midia_ou_texto(timeout_s=timeout_min * 60)
 
-            if novo_caminho:
-                clipe['path'] = novo_caminho
-                clipe['fonte'] = 'telegram_manual'
-                enviar_texto("✅ Mídia substituída, seguindo pro próximo clipe.")
-                break
+                if recebido is None:
+                    enviar_texto(f"⏱️ Sem resposta em {timeout_min} min — mantendo o clipe original.")
+                    break
 
-            enviar_texto("⚠️ Não consegui usar essa mídia — manda de novo, ou cancela.")
-            # volta ao topo do while: pergunta cancelar/enviar de novo
+                novo_caminho = (_baixar_pexels_por_id(recebido['texto']) if recebido['tipo'] == 'texto'
+                                 else recebido['caminho'])
+                if not novo_caminho:
+                    enviar_texto("⚠️ Não consegui usar essa mídia — manda de novo, ou cancela.")
+
+        if novo_caminho:
+            clipe['path'] = novo_caminho
+            clipe['fonte'] = 'telegram_manual'
+            enviar_texto(f"✅ Clipe {i + 1} substituído, seguindo pro próximo.")
 
     enviar_texto(f"✅ Revisão do segmento \"{nome_segmento}\" concluída.")
     return lista_clipes

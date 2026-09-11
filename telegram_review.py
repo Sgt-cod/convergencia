@@ -50,6 +50,7 @@ import time
 import json
 
 import requests
+from PIL import Image, ImageOps
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
@@ -355,7 +356,44 @@ def _baixar_arquivo_telegram(file_id, download_dir, extensao):
     resp.raise_for_status()
     with open(destino, 'wb') as f:
         f.write(resp.content)
+    if extensao.lower() in ('.jpg', '.jpeg', '.png'):
+        _normalizar_imagem(destino)
     return destino
+
+
+def _normalizar_imagem(caminho, largura_max=1920):
+    """
+    BUGFIX (renderização travando em ~4%, sempre no mesmo frame): foto mandada direto
+    do celular pelo Telegram costuma vir em 3000-4000px+ de largura — bem maior que
+    qualquer imagem que o pipeline automático já lida (Pexels/Wikimedia já vêm em
+    resolução moderada). O efeito de zoom (_clip_de_imagem_com_zoom, em
+    generate_video.py) reprocessa a imagem A CADA FRAME pra animar o zoom — com uma
+    foto de celular gigante sem redimensionar antes, cada frame fica MUITO mais caro
+    de calcular, e como o zoom dura o clipe inteiro, a exportação não trava de vez,
+    só fica absurdamente lenta (segundos por frame em vez de frames por segundo) —
+    o que parece travado mas é só um vídeo de ~30-60s de duração real do clipe
+    levando dezenas de minutos pra renderizar.
+
+    Redimensiona pra no máximo 'largura_max' no lado maior (de sobra pra qualquer
+    resolução de saída do vídeo, sem carregar peso à toa) e corrige a rotação EXIF
+    (foto de celular quase sempre tem isso, e sem corrigir alguns leitores mostram a
+    imagem de lado). Roda uma vez, no download — nunca durante a renderização.
+    """
+    try:
+        img = Image.open(caminho)
+        img = ImageOps.exif_transpose(img)  # corrige rotação de foto de celular
+        if img.mode not in ('RGB',):
+            img = img.convert('RGB')
+        if max(img.size) > largura_max:
+            escala = largura_max / max(img.size)
+            novo_tamanho = (max(1, int(img.width * escala)), max(1, int(img.height * escala)))
+            img = img.resize(novo_tamanho, Image.LANCZOS)
+            print(f"    🖼️ Imagem redimensionada pra {novo_tamanho[0]}x{novo_tamanho[1]} "
+                  f"antes de entrar no pipeline (estava maior que {largura_max}px)")
+        img.save(caminho, quality=90)
+    except Exception as e:
+        print(f"    ⚠️ Falha ao normalizar imagem '{caminho}' ({e}) — usando como veio, "
+              f"pode deixar a renderização mais lenta se for muito grande")
 
 
 # ============================================================
@@ -419,6 +457,8 @@ def _baixar_pexels_por_id(url, download_dir=None, largura_alvo=1920):
         conteudo.raise_for_status()
         with open(destino, 'wb') as f:
             f.write(conteudo.content)
+        if eh_foto:
+            _normalizar_imagem(destino, largura_max=largura_alvo)
         return destino
     except Exception as e:
         print(f"    ⚠️ Falha ao baixar item {pexels_id} do Pexels ({e})")

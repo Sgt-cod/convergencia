@@ -84,19 +84,50 @@ def _timeout_min(chave, padrao):
 # ============================================================
 
 def _chamar(metodo, **params):
-    resp = requests.post(f"{_API_BASE}/{metodo}", data=params, timeout=30)
-    resp.raise_for_status()
+    resp = _requisitar_com_retry('post', f"{_API_BASE}/{metodo}", data=params, timeout=30)
     dados = resp.json()
     if not dados.get('ok'):
         raise RuntimeError(f"Telegram API '{metodo}' falhou: {dados}")
     return dados['result']
 
 
+def _requisitar_com_retry(verbo, url, tentativas=3, espera_s=3, **kwargs):
+    """
+    BUGFIX (Telegram parou de interagir no meio do workflow): getUpdates é uma conexão
+    de long-polling — só UMA pode estar "ativa" por bot de cada vez. Se uma run anterior
+    for cancelada manualmente (ex: no GitHub Actions) enquanto uma requisição de
+    getUpdates está em aberto, o Telegram pode devolver 409 Conflict ("terminated by
+    other getUpdates request") pras primeiras chamadas da run seguinte, até a conexão
+    antiga expirar de vez do lado do servidor do Telegram. Sem isso, uma única 409
+    (ou qualquer erro de rede transitório) subia sem tratamento e travava a interação
+    pro resto do workflow. Agora tenta de novo, com espera progressiva, antes de desistir.
+    """
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        try:
+            resp = requests.request(verbo, url, **kwargs)
+            if resp.status_code == 409:
+                raise requests.exceptions.HTTPError(f"409 Conflict em {url}", response=resp)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa < tentativas:
+                print(f"    ⚠️ Telegram API falhou (tentativa {tentativa}/{tentativas}: {e}) "
+                      f"— tentando de novo em {espera_s}s...")
+                time.sleep(espera_s * tentativa)
+    raise ultimo_erro
+
+
 def _enviar_arquivo(metodo, campo_arquivo, caminho, **params):
+    # lê o arquivo pra memória ANTES de tentar — se _requisitar_com_retry precisar
+    # tentar de novo (ex: depois de um 409), reabrir o arquivo a cada tentativa
+    # evitaria o bug de mandar corpo vazio na 2ª tentativa (stream já consumido)
     with open(caminho, 'rb') as f:
-        resp = requests.post(f"{_API_BASE}/{metodo}", data=params,
-                              files={campo_arquivo: f}, timeout=120)
-    resp.raise_for_status()
+        conteudo = f.read()
+    nome_arquivo = os.path.basename(caminho)
+    resp = _requisitar_com_retry('post', f"{_API_BASE}/{metodo}", data=params,
+                                  files={campo_arquivo: (nome_arquivo, conteudo)}, timeout=120)
     dados = resp.json()
     if not dados.get('ok'):
         raise RuntimeError(f"Telegram API '{metodo}' falhou: {dados}")
@@ -192,27 +223,37 @@ def _descartar_atualizacoes_antigas():
         return
     _offset_inicializado = True
     try:
-        resp = requests.get(f"{_API_BASE}/getUpdates", params={'timeout': 0}, timeout=15)
-        resp.raise_for_status()
+        resp = _requisitar_com_retry('get', f"{_API_BASE}/getUpdates",
+                                      params={'timeout': 0}, timeout=15)
         updates = resp.json().get('result', [])
         if updates:
             _offset_updates = updates[-1]['update_id'] + 1
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"    ⚠️ Não consegui limpar updates antigos do Telegram ({e}) — seguindo mesmo assim")
 
 
 def _proximos_updates(timeout_long_poll=25):
     """Busca updates novos do Telegram e devolve a lista crua — usado só por
     escolher_tema_telegram/escolher_destaques_telegram, que têm laços próprios (não
     passam pelas filas _fila_callbacks/_fila_mensagens porque rodam ANTES/fora do
-    laço de revisão de clipe a clipe, sem risco de mistura entre clipes)."""
+    laço de revisão de clipe a clipe, sem risco de mistura entre clipes).
+
+    BUGFIX: antes, um erro aqui (ex: 409 Conflict — ver _requisitar_com_retry) subia
+    sem tratamento e travava a interação pro resto do workflow. Agora tenta de novo
+    algumas vezes; se mesmo assim falhar, devolve lista vazia (o loop de quem chamou
+    simplesmente tenta de novo no próximo ciclo) em vez de derrubar o processo inteiro.
+    """
     global _offset_updates
     _descartar_atualizacoes_antigas()
     params = {'timeout': timeout_long_poll}
     if _offset_updates is not None:
         params['offset'] = _offset_updates
-    resp = requests.get(f"{_API_BASE}/getUpdates", params=params, timeout=timeout_long_poll + 10)
-    resp.raise_for_status()
+    try:
+        resp = _requisitar_com_retry('get', f"{_API_BASE}/getUpdates", params=params,
+                                      timeout=timeout_long_poll + 10)
+    except Exception as e:
+        print(f"    ⚠️ getUpdates do Telegram falhou repetidamente ({e}) — tentando de novo...")
+        return []
     dados = resp.json()
     if not dados.get('ok'):
         return []
@@ -328,11 +369,19 @@ def _extrair_id_pexels(url):
     return m.group(1) if m else None
 
 
-def _baixar_pexels_por_id(url, download_dir=None):
-    """Aceita link de /video/ ou /photo/ do Pexels e baixa a maior variante disponível
-    daquele item específico (não uma busca — o ID exato que a URL aponta). Retorna o
-    caminho local ou None se não conseguir resolver (URL sem ID, sem chave de API, ou
-    erro de rede — sempre logado, nunca deixa a revisão travada sem explicação)."""
+def _baixar_pexels_por_id(url, download_dir=None, largura_alvo=1920):
+    """Aceita link de /video/ ou /photo/ do Pexels e baixa a variante daquele item
+    específico mais próxima de 'largura_alvo' (não uma busca — o ID exato que a URL
+    aponta). Retorna o caminho local ou None se não conseguir resolver (URL sem ID,
+    sem chave de API, ou erro de rede — sempre logado, nunca deixa a revisão travada
+    sem explicação).
+
+    BUGFIX (vídeo suspeito de travar a renderização em ~4%): antes pegava sempre a
+    MAIOR resolução disponível (podia vir 4K de um vídeo Pexels) — bem mais pesado pra
+    decodificar/redimensionar que o necessário, já que o vídeo final não passa da
+    resolução configurada mesmo. O resto do pipeline (baixar_clipes_pexels,
+    _escolher_arquivo_video) já escolhe a variante mais PRÓXIMA da largura alvo, não a
+    maior — agora aqui faz o mesmo, por consistência e performance."""
     download_dir = download_dir or os.path.join('assets', 'telegram_review')
     os.makedirs(download_dir, exist_ok=True)
 
@@ -358,8 +407,8 @@ def _baixar_pexels_por_id(url, download_dir=None):
             resp = requests.get(f"https://api.pexels.com/videos/videos/{pexels_id}",
                                  headers=headers, timeout=20)
             resp.raise_for_status()
-            arquivos = [vf for vf in resp.json().get('video_files', []) if vf.get('link')]
-            link = max(arquivos, key=lambda vf: vf.get('width') or 0)['link'] if arquivos else None
+            arquivos = [vf for vf in resp.json().get('video_files', []) if vf.get('link') and vf.get('width')]
+            link = min(arquivos, key=lambda vf: abs(vf['width'] - largura_alvo))['link'] if arquivos else None
             destino = os.path.join(download_dir, f"pexels_video_{pexels_id}.mp4")
 
         if not link:
@@ -397,7 +446,8 @@ def _trecho_do_roteiro(texto_segmento, palavras_tempo, inicio, fim):
 # Revisão de mídia, clipe a clipe
 # ============================================================
 
-def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_segmento):
+def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_segmento,
+                            largura_alvo=1920):
     """
     Chamada de dentro de renderizar_segmento_webdoc, DEPOIS de baixar_clipes_por_bloco
     e ANTES de montar o vídeo (_montar_clips_pexels) — lista_clipes ainda está em
@@ -410,6 +460,11 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
         sem precisar clicar em nada antes — vale como "recusar + já aqui está a mídia"
     Isso deixa mandar tudo em sequência rápida (como a maioria das pessoas naturalmente
     faz) sem precisar esperar o bot reperguntar a cada clipe.
+
+    largura_alvo: passado pra _baixar_pexels_por_id — garante que um link de Pexels
+    baixe a variante de resolução mais próxima do vídeo final (não a maior disponível,
+    que pode ser 4K e pesar bem mais na hora de renderizar sem ganho nenhum de
+    qualidade perceptível no resultado final).
 
     Devolve a MESMA lista, com 'path' trocado nos clipes que foram substituídos.
     Levanta WorkflowCanceladoPeloUsuario se o usuário cancelar.
@@ -454,8 +509,8 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
 
         if tipo == 'mensagem':
             # usuário já mandou a substituição direto, sem clicar em nada
-            novo_caminho = (_baixar_pexels_por_id(valor['texto']) if valor['tipo'] == 'texto'
-                             else valor['caminho'])
+            novo_caminho = (_baixar_pexels_por_id(valor['texto'], largura_alvo=largura_alvo)
+                             if valor['tipo'] == 'texto' else valor['caminho'])
             if not novo_caminho:
                 enviar_texto(f"⚠️ Não consegui usar essa mídia pro clipe {i + 1} — "
                              f"mantendo o clipe original.")
@@ -479,8 +534,8 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
                     enviar_texto(f"⏱️ Sem resposta em {timeout_min} min — mantendo o clipe original.")
                     break
 
-                novo_caminho = (_baixar_pexels_por_id(recebido['texto']) if recebido['tipo'] == 'texto'
-                                 else recebido['caminho'])
+                novo_caminho = (_baixar_pexels_por_id(recebido['texto'], largura_alvo=largura_alvo)
+                                 if recebido['tipo'] == 'texto' else recebido['caminho'])
                 if not novo_caminho:
                     enviar_texto("⚠️ Não consegui usar essa mídia — manda de novo, ou cancela.")
 

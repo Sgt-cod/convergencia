@@ -1758,7 +1758,15 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
 
         destaques_manuais = None
         if ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
-            destaques_manuais = escolher_destaques_telegram(texto_segmento, nome_segmento)
+            # BUGFIX: uma falha de rede/API do Telegram aqui (ex: 409 Conflict de uma
+            # run anterior cancelada) não pode derrubar o segmento inteiro nem, pior,
+            # deixar a interação "morta" pro resto do workflow sem nenhum aviso — cai
+            # pra escolha automática (Gemini) SÓ deste segmento, e segue.
+            try:
+                destaques_manuais = escolher_destaques_telegram(texto_segmento, nome_segmento)
+            except Exception as e:
+                print(f"  ⚠️ Falha na escolha de destaques via Telegram ({e}) — "
+                      f"usando escolha automática pra este segmento")
 
         if destaques_manuais is not None:
             destaques_por_bloco = mapear_destaques_manuais_para_blocos(blocos_com_tempo_local, destaques_manuais)
@@ -1781,8 +1789,14 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
         raise RuntimeError(f"Nenhum clipe de B-roll baixado pro segmento '{nome_segmento}'")
 
     if ATIVA_TELEGRAM and config.get('telegram_review', {}).get('ativo', False):
-        lista_clipes = revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo,
-                                               nome_segmento)
+        try:
+            lista_clipes = revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo,
+                                                   nome_segmento, largura_alvo=largura)
+        except WorkflowCanceladoPeloUsuario:
+            raise  # decisão explícita do usuário — sempre propaga, nunca é "só uma falha"
+        except Exception as e:
+            print(f"  ⚠️ Falha na revisão de mídia via Telegram ({e}) — seguindo com a "
+                  f"mídia escolhida automaticamente pra este segmento")
 
     # duracao_segmento até aqui é a duração PURA da narração (0s = 1ª palavra falada,
     # fim = última palavra). lista_clipes/clips_legenda/clips_destaque/eventos_sfx
@@ -2502,7 +2516,10 @@ def main():
 
     tema = None
     if ATIVA_TELEGRAM and config.get('selecao_tema_telegram', {}).get('ativo', False):
-        tema = escolher_tema_telegram()  # None = usuário pediu automático (ou timeout)
+        try:
+            tema = escolher_tema_telegram()  # None = usuário pediu automático (ou timeout)
+        except Exception as e:
+            print(f"  ⚠️ Falha na seleção de tema via Telegram ({e}) — escolhendo automaticamente")
     if not tema:
         tema = escolher_tema_reflexao()
 

@@ -1372,6 +1372,16 @@ def _escolher_fonte_midia_alternativa(termo, termo_especifico=None):
 
 def _preparar_clip_pexels(item, largura, altura):
     if item['path'].lower().endswith(('.png', '.jpg', '.jpeg')):
+        # Diagnóstico: se a exportação parecer "travada" de novo, o log já mostra na
+        # hora qual imagem entrou grande demais no pipeline, sem precisar caçar depois.
+        try:
+            with Image.open(item['path']) as _img_diag:
+                if max(_img_diag.size) > 2200:
+                    print(f"    ⚠️ Imagem {item['path']} entrando no vídeo em "
+                          f"{_img_diag.size[0]}x{_img_diag.size[1]} — grande o bastante "
+                          f"pra deixar o zoom lento por frame durante a renderização")
+        except Exception:
+            pass
         # Wikimedia/Internet Archive usam zoom-out + vinheta vintage (ver
         # _escolher_fonte_midia_alternativa) — Agnes e print de notícia usam o zoom-in
         # normal, porque são imagens "novas"/geradas, não material de arquivo.

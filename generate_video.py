@@ -1596,7 +1596,7 @@ def criar_video_curto(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     video_final = video_base.set_audio(audio_final)
     video_final.write_videofile(output_file, fps=30, codec='libx264', audio_codec='aac',
-                                 preset='medium', bitrate='8000k', threads=4)
+                                 preset='medium', bitrate='8000k', threads=4, write_logfile=True)
 
     video_final.close()
     audio_narr.close()
@@ -1689,7 +1689,7 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
 
     video_final = video_base.set_audio(audio_final)
     video_final.write_videofile(output_file, fps=24, codec='libx264', audio_codec='aac',
-                                 preset='medium', bitrate='6000k', threads=4)
+                                 preset='medium', bitrate='6000k', threads=4, write_logfile=True)
 
     video_final.close()
     audio_narr.close()
@@ -1935,7 +1935,7 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
         video_final = video_final.set_audio(video_final.audio.audio_fadeout(SEGUNDOS_FADEOUT))
 
     video_final.write_videofile(output_file, fps=24, codec='libx264', audio_codec='aac',
-                                 preset='medium', bitrate='6000k', threads=4)
+                                 preset='medium', bitrate='6000k', threads=4, write_logfile=True)
     video_final.close()
     return output_file
 

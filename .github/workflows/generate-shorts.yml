@@ -1,8 +1,8 @@
 name: Gerar Shorts
 
 on:
-  schedule:
-    - cron: '0 10 * * *'  # 07:00 BRT (UTC-3), todos os dias
+  # schedule:
+    # - cron: '0 10 * * *'  # 07:00 BRT (UTC-3), todos os dias
   workflow_dispatch:
 
 permissions:

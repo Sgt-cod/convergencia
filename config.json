@@ -78,15 +78,15 @@
   },
   "telegram_review": {
     "ativo": true,
-    "timeout_resposta_min": 30
+    "timeout_resposta_min": 120
   },
   "selecao_tema_telegram": {
     "ativo": true,
-    "timeout_resposta_min": 40
+    "timeout_resposta_min": 120
   },
   "destaques_telegram": {
     "ativo": true,
-    "timeout_resposta_min": 40
+    "timeout_resposta_min": 120
   },
   "max_destaques_por_bloco": 1,
   "volume_musica_fundo": 0.10,

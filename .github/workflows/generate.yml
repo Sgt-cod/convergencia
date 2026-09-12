@@ -1,8 +1,8 @@
 name: Gerar e Publicar Vídeo Longo
 
 on:
-  schedule:
-    - cron: '0 19 * * *'  # 16:00 BRT (UTC-3), segunda e quinta
+  # schedule:
+    # - cron: '0 19 * * *'  # 16:00 BRT (UTC-3), segunda e quinta
   workflow_dispatch:
 
 permissions:

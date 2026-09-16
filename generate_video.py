@@ -23,6 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 if hasattr(signal, 'SIGUSR1'):
     faulthandler.register(signal.SIGUSR1, all_threads=True)
 from moviepy.editor import *
+import moviepy_patch  # corrige deadlock do leitor do MoviePy (stderr=PIPE nunca drenado)
 from google import generativeai as genai
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest

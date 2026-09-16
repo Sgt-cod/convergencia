@@ -49,6 +49,8 @@ import re
 import time
 import json
 
+import hashlib
+import itertools
 import requests
 from PIL import Image, ImageOps
 from rede_utils import com_watchdog
@@ -348,11 +350,23 @@ def _aguardar_callback_ou_midia(timeout_s=1800):
     return (None, None)
 
 
+_contador_downloads = itertools.count(1)
+
+
 def _baixar_arquivo_telegram(file_id, download_dir, extensao):
     info = _chamar('getFile', file_id=file_id)
     file_path = info['file_path']
     url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-    destino = os.path.join(download_dir, f"tg_{file_id[:16]}{extensao}")
+    # BUGFIX (fotos enviadas pelo Telegram apareciam repetidas e fora de ordem):
+    # o nome era montado com file_id[:16], mas os file_id do Telegram compartilham
+    # um prefixo longo (tipo + datacenter + chat). Duas fotos diferentes do mesmo
+    # chat geravam EXATAMENTE o mesmo nome, então cada download sobrescrevia o
+    # anterior — e na hora de renderizar todos os slots liam o mesmo arquivo,
+    # mostrando a mesma mídia várias vezes. Agora o nome usa o hash do file_id
+    # INTEIRO (sem truncar) mais um contador, garantindo nome único por download.
+    assinatura = hashlib.sha1(file_id.encode('utf-8')).hexdigest()[:20]
+    seq = next(_contador_downloads)
+    destino = os.path.join(download_dir, f"tg_{seq:03d}_{assinatura}{extensao}")
     resp = com_watchdog(requests.get, url, timeout=60,
                          timeout_total=90, label="download de arquivo do Telegram")
     if resp is None or not resp.ok:

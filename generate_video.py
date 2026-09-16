@@ -4,6 +4,7 @@ import random
 import re
 import asyncio
 import time
+import math
 import signal
 import faulthandler
 from datetime import datetime
@@ -1406,6 +1407,19 @@ def _preparar_clip_pexels(item, largura, altura):
     clip = VideoFileClip(item['path'], target_resolution=(altura, None))
     if clip.duration > item['duracao']:
         clip = clip.subclip(0, item['duracao'])
+    elif clip.duration < item['duracao'] - 0.05:
+        # BUGFIX (vídeo enviado pelo Telegram aparecia congelado): o slot vem do
+        # roteiro, mas um vídeo mandado do celular tem a duração que tem. Quando é
+        # mais curto que o slot, o leitor do MoviePy passa do fim do arquivo e
+        # devolve o ÚLTIMO frame válido repetidamente ("Using the last valid frame
+        # instead") — que é exatamente a imagem congelada. Repetindo o clipe até
+        # cobrir o slot, a tela continua com movimento até a próxima transição.
+        # (Só não acontecia no último capítulo porque lá o vídeo enviado já era
+        # longo o bastante pro slot.)
+        repeticoes = int(math.ceil(item['duracao'] / max(clip.duration, 0.1)))
+        print(f"    🔁 Mídia de {clip.duration:.1f}s menor que o slot de "
+              f"{item['duracao']:.1f}s — repetindo {repeticoes}x pra não congelar")
+        clip = concatenate_videoclips([clip] * repeticoes).subclip(0, item['duracao'])
 
     if clip.w > largura:
         clip = clip.crop(x_center=clip.w / 2, width=largura, height=altura)

@@ -83,9 +83,14 @@ jobs:
           PID=$!
           echo "generate_video.py rodando com PID $PID"
 
+          # O diagnóstico já cumpriu a função (identificou o gargalo em
+          # skip_frames/target_resolution). Mantido em intervalo LARGO (5 min)
+          # só como rede de segurança: dá pra ver o log de progresso normal sem
+          # a enxurrada de stack traces, mas se algo travar de verdade ainda
+          # sobra rastro. Pra investigar de novo, baixe pra sleep 15.
           (
             while kill -0 "$PID" 2>/dev/null; do
-              sleep 15
+              sleep 300
               if kill -0 "$PID" 2>/dev/null; then
                 echo "=== $(date -u '+%Y-%m-%d %H:%M:%S') UTC: SIGUSR1 enviado (stack trace vai aparecer no gerar_video_stdout.log logo em seguida) ===" >> diagnostico_stacks.log
                 kill -USR1 "$PID"

@@ -7,6 +7,7 @@ import time
 import math
 import signal
 import faulthandler
+import shutil
 from datetime import datetime
 import requests
 import edge_tts
@@ -48,6 +49,7 @@ from rede_utils import com_watchdog
 from telegram_review import (
     ATIVA_TELEGRAM, revisar_midia_pipeline, escolher_tema_telegram,
     escolher_destaques_telegram, revisar_thumbnail_telegram, WorkflowCanceladoPeloUsuario,
+    perguntar_audio_customizado_telegram,
 )
 
 # ============================================================
@@ -1749,7 +1751,33 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     os.makedirs(pasta, exist_ok=True)
     texto_segmento = " ".join(aplicar_correcoes_pronuncia(b['texto']) for b in grupo_blocos)
     audio_path_seg = f'{pasta}/seg_{indice_segmento:02d}.mp3'
-    criar_audio(texto_segmento, audio_path_seg)
+
+    # Perguntados AQUI, com base só no TEXTO do segmento — antes de qualquer TTS
+    # rodar. destaques_manuais_pre é reaproveitado mais abaixo (não pergunta nunca
+    # duas vezes); a pergunta de áudio precisa vir antes da chamada à Fish Audio
+    # pra não gastar TTS à toa quando você já sabe que vai mandar o seu.
+    destaques_manuais_pre = None
+    if ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
+        try:
+            destaques_manuais_pre = escolher_destaques_telegram(texto_segmento, nome_segmento)
+        except Exception as e:
+            print(f"  ⚠️ Falha na escolha de destaques via Telegram ({e}) — "
+                  f"usando escolha automática pra este segmento")
+
+    audio_customizado = None
+    if ATIVA_TELEGRAM and config.get('audio_customizado_telegram', {}).get('ativo', True):
+        try:
+            audio_customizado = perguntar_audio_customizado_telegram(nome_segmento)
+        except Exception as e:
+            print(f"  ⚠️ Falha ao perguntar áudio customizado via Telegram ({e}) — "
+                  f"gerando narração automática pra este segmento")
+
+    if audio_customizado:
+        shutil.copyfile(audio_customizado, audio_path_seg)
+        print(f"  🎙️ Usando áudio enviado por você pro segmento '{nome_segmento}' "
+              f"(sem pausas artificiais — o áudio já está do jeito que você quer)")
+    else:
+        criar_audio(texto_segmento, audio_path_seg)
 
     try:
         palavras_tempo = transcrever_palavras_com_timestamps(audio_path_seg)
@@ -1795,17 +1823,7 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
         )
         lista_clipes = baixar_clipes_por_bloco(blocos_com_tempo_local, orientacao)
 
-        destaques_manuais = None
-        if ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
-            # BUGFIX: uma falha de rede/API do Telegram aqui (ex: 409 Conflict de uma
-            # run anterior cancelada) não pode derrubar o segmento inteiro nem, pior,
-            # deixar a interação "morta" pro resto do workflow sem nenhum aviso — cai
-            # pra escolha automática (Gemini) SÓ deste segmento, e segue.
-            try:
-                destaques_manuais = escolher_destaques_telegram(texto_segmento, nome_segmento)
-            except Exception as e:
-                print(f"  ⚠️ Falha na escolha de destaques via Telegram ({e}) — "
-                      f"usando escolha automática pra este segmento")
+        destaques_manuais = destaques_manuais_pre
 
         if destaques_manuais is not None:
             destaques_por_bloco = mapear_destaques_manuais_para_blocos(blocos_com_tempo_local, destaques_manuais)

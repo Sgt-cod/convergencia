@@ -51,6 +51,7 @@ import json
 
 import hashlib
 import itertools
+import subprocess
 import requests
 from PIL import Image, ImageOps
 from rede_utils import com_watchdog
@@ -295,6 +296,17 @@ def _classificar_update(upd):
         ext = os.path.splitext(nome)[1].lower() or '.bin'
         caminho = _baixar_arquivo_telegram(msg['document']['file_id'], _pasta_downloads_padrao(), ext)
         return ('mensagem', {'tipo': 'documento', 'caminho': caminho, 'texto': None})
+    if msg.get('voice'):
+        # Nota de voz do Telegram: sempre .ogg (Opus). O ffmpeg abre esse formato
+        # sem problema, mas convertemos pra mp3 na hora de usar (ver
+        # _normalizar_audio_para_segmento), já que o resto do pipeline espera mp3.
+        caminho = _baixar_arquivo_telegram(msg['voice']['file_id'], _pasta_downloads_padrao(), '.ogg')
+        return ('mensagem', {'tipo': 'audio', 'caminho': caminho, 'texto': None})
+    if msg.get('audio'):
+        nome = msg['audio'].get('file_name', 'audio')
+        ext = os.path.splitext(nome)[1].lower() or '.mp3'
+        caminho = _baixar_arquivo_telegram(msg['audio']['file_id'], _pasta_downloads_padrao(), ext)
+        return ('mensagem', {'tipo': 'audio', 'caminho': caminho, 'texto': None})
     if msg.get('text'):
         return ('mensagem', {'tipo': 'texto', 'caminho': None, 'texto': msg['text'].strip()})
     return None
@@ -610,6 +622,92 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
 # ============================================================
 # Seleção de tema no início do workflow
 # ============================================================
+
+# ============================================================
+# Áudio customizado (usuário grava/manda a própria narração do segmento)
+# ============================================================
+
+def _normalizar_audio_para_segmento(caminho_origem, destino_mp3):
+    """
+    Converte QUALQUER formato de áudio que o Telegram mande (nota de voz é sempre
+    .ogg/Opus; arquivo pode vir em .mp3/.m4a/.wav/etc.) pro mp3 no caminho exato
+    que renderizar_segmento_webdoc já espera (audio_path_seg). Depois disso, o
+    resto do pipeline (Whisper, AudioFileClip, SFX, música de fundo...) trata esse
+    áudio exatamente como trataria uma narração gerada por TTS — nenhum outro
+    ponto do código precisa saber que a origem foi manual.
+    """
+    cmd = ['ffmpeg', '-y', '-i', caminho_origem, '-vn', '-acodec', 'libmp3lame',
+           '-q:a', '2', destino_mp3]
+    resultado = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if resultado.returncode != 0:
+        raise RuntimeError(f"Falha ao converter áudio enviado pra mp3: {resultado.stderr[-500:]}")
+    return destino_mp3
+
+
+def perguntar_audio_customizado_telegram(nome_segmento, timeout_min=None):
+    """
+    Chamada ANTES de gerar a narração (Fish Audio) de um segmento (introdução,
+    capítulo N ou desfecho): pergunta se você quer mandar seu PRÓPRIO áudio pra
+    esse trecho, em vez do pipeline gerar por TTS. Evita gastar uma chamada de
+    TTS à toa quando você já sabe que vai substituir.
+
+    Pode responder de dois jeitos, igual às outras revisões:
+      - clicando um dos botões
+      - já mandando o áudio (nota de voz ou arquivo) DIRETO, sem clicar em nada
+
+    O áudio mandado é usado como está — SEM inserir pausas artificiais entre
+    frases (essa lógica é só do gerador TTS por trechos, que nem roda nesse
+    caminho); o pipeline só aplica as margens de silêncio antes/depois do
+    segmento, exatamente como já faz com a narração gerada automaticamente.
+
+    Devolve o CAMINHO do mp3 já convertido, ou None se você decidir não mandar
+    (ou não responder a tempo — nesse caso segue com TTS normal, não trava o
+    pipeline esperando).
+    """
+    if not ATIVA_TELEGRAM:
+        return None
+    if timeout_min is None:
+        timeout_min = _timeout_min('audio_customizado_telegram', 15)
+
+    limpar_filas_pendentes()
+    enviar_texto(
+        f"🎙️ Segmento \"{nome_segmento}\": quer mandar seu PRÓPRIO áudio pra esse "
+        f"trecho, em vez de eu gerar a narração? Pode ser nota de voz ou arquivo "
+        f"de áudio.",
+        botoes=[('🎙️ Vou mandar', 'vou_mandar'), ('🤖 Gerar automático', 'automatico')]
+    )
+
+    while True:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+
+        if tipo is None:
+            print(f"    ⏱️ Sem resposta em {timeout_min} min — gerando narração automática")
+            return None
+
+        if tipo == 'callback' and valor == 'automatico':
+            print("    🤖 Optou por narração automática pra este segmento")
+            return None
+
+        if tipo == 'callback' and valor == 'vou_mandar':
+            enviar_texto("Manda o áudio (nota de voz ou arquivo).")
+            continue
+
+        if tipo == 'mensagem' and valor['tipo'] == 'audio':
+            pasta = _pasta_downloads_padrao()
+            destino_mp3 = os.path.join(pasta, f"audio_custom_{nome_segmento}.mp3")
+            try:
+                _normalizar_audio_para_segmento(valor['caminho'], destino_mp3)
+            except Exception as e:
+                enviar_texto(f"⚠️ Não consegui processar esse áudio ({e}). Manda de novo, "
+                             f"ou aperta 🤖 Gerar automático.")
+                continue
+            print(f"    🎙️ Áudio próprio recebido pra '{nome_segmento}'")
+            return destino_mp3
+
+        # texto solto, foto, vídeo ou documento não servem de áudio
+        enviar_texto("⚠️ Preciso de um ÁUDIO (nota de voz ou arquivo de áudio). Manda de "
+                     "novo, ou aperta 🤖 Gerar automático pra eu gerar a narração.")
+
 
 # ============================================================
 # Escolha manual de palavras de destaque

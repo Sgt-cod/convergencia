@@ -24,6 +24,40 @@ Três peças, nessa ordem de uso no generate_video.py:
 """
 
 import json
+import re
+
+
+def _corrigir_metro_quadrado(m):
+    """Callback do regex abaixo: recompõe 'metro(s)' preservando maiúscula inicial
+    se o texto original ('Metrô'/'metrô') também tinha."""
+    base = 'metro' + (m.group(1) or '')
+    return base.capitalize() if m.group(0)[0].isupper() else base
+
+
+# Rede de segurança contra erros de ortografia recorrentes que o Gemini às vezes
+# comete ao gerar manchete/corpo/trecho_destaque do print de notícia — além do
+# aviso já reforçado no prompt acima, isso corrige automaticamente se ainda
+# assim escapar. Cada entrada é (padrão, substituto); o substituto pode ser uma
+# string (re.sub normal) ou uma função (callback, pra casos que dependem do que
+# foi casado, tipo preservar plural/maiúscula).
+_CORRECOES_TEXTO_COMUNS = [
+    # "metro quadrado/cúbico" (unidade de medida, SEM acento) é frequentemente
+    # confundido com "metrô" (o transporte, COM acento) — só errado nesse contexto
+    # específico, então o padrão exige que "quadrado(s)"/"cúbico(s)" venha logo
+    # depois, pra não mexer em frases que realmente falam do transporte.
+    (re.compile(r'\bmetrô(s)?(?=\s+(?:quadrados?|c[uú]bicos?)\b)', re.IGNORECASE),
+     _corrigir_metro_quadrado),
+]
+
+
+def _corrigir_erros_comuns_portugues(texto):
+    """Aplica as correções de _CORRECOES_TEXTO_COMUNS. Idempotente e segura pra
+    string vazia/None."""
+    if not texto:
+        return texto
+    for padrao, substituto in _CORRECOES_TEXTO_COMUNS:
+        texto = padrao.sub(substituto, texto)
+    return texto
 
 
 def _extrair_json(texto):
@@ -246,7 +280,12 @@ Para cada bloco escolhido, escreva:
 
 Retorne APENAS JSON:
 {{"escolhidos": [{{"indice": 0, "manchete": "...", "corpo": "...", "trecho_destaque": "..."}}]}}
-Se nenhum bloco se encaixar (ex: todos são só reflexão/opinião), retorne {{"escolhidos": []}}."""
+Se nenhum bloco se encaixar (ex: todos são só reflexão/opinião), retorne {{"escolhidos": []}}.
+
+ATENÇÃO À ORTOGRAFIA: "metro" (unidade de medida, ex: "metro quadrado", "metros
+cúbicos") NUNCA leva acento — é diferente de "metrô" (o transporte sobre trilhos),
+que sempre leva. Preste atenção especial nessa distinção; não escreva "metrô
+quadrado"."""
 
     try:
         resposta = gemini_generate_fn(prompt)
@@ -257,9 +296,10 @@ Se nenhum bloco se encaixar (ex: todos são só reflexão/opinião), retorne {{"
 
     for item in escolhidos:
         i = item.get('indice')
-        corpo = (item.get('corpo') or '').strip()
+        corpo = _corrigir_erros_comuns_portugues((item.get('corpo') or '').strip())
         if isinstance(i, int) and 0 <= i < len(blocos_com_tempo) and item.get('manchete') and corpo:
-            trecho_destaque = (item.get('trecho_destaque') or '').strip()
+            trecho_destaque = _corrigir_erros_comuns_portugues((item.get('trecho_destaque') or '').strip())
+            manchete = _corrigir_erros_comuns_portugues(item['manchete'].strip())
             # Se o Gemini não copiou o trecho literalmente (aconteceu, principalmente
             # com pontuação diferente), simplesmente não destaca nada — melhor um print
             # sem trecho em vermelho do que gerar_print_noticia tentando achar uma
@@ -269,7 +309,7 @@ Se nenhum bloco se encaixar (ex: todos são só reflexão/opinião), retorne {{"
                       f"'corpo' — seguindo sem destaque em vermelho pra esse print")
                 trecho_destaque = ""
             blocos_com_tempo[i]['usa_print_noticia'] = True
-            blocos_com_tempo[i]['manchete_noticia'] = item['manchete'].strip()
+            blocos_com_tempo[i]['manchete_noticia'] = manchete
             blocos_com_tempo[i]['corpo_noticia'] = corpo
             blocos_com_tempo[i]['trecho_destaque_noticia'] = trecho_destaque
 

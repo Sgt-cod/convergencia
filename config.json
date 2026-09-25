@@ -12,7 +12,7 @@
 
   "transicoes_video": ["crossfade", "flash", "shadow_wipe"],
   "usar_prints_noticia": true,
-  "usar_legenda": false,
+  "usar_legenda": true,
 
   "tags_padrao": [
     "brasil",

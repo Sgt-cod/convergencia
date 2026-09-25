@@ -89,13 +89,7 @@
     "ativo": true,
     "timeout_resposta_min": 120
   },
-  "correcoes_pronuncia": {
-  "eua": "estados unidos",
-  "minutos": "minutos",
-  "minuto": "minuto",
-  "min": "minuto",
-  "mins": "minutos",
-  },
+  
 
   "max_destaques_por_bloco": 1,
   "volume_musica_fundo": 0.07,

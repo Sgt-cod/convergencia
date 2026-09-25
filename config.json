@@ -10,6 +10,7 @@
   "fonte_thumbnail_arquivo": "assets/fonts/Rowdies-Bold.ttf",
   "fonte_destaque_arquivo": "assets/fonts/Rowdies-Bold.ttf",
 
+
   "transicoes_video": ["crossfade", "flash", "shadow_wipe"],
   "usar_prints_noticia": true,
   "usar_legenda": true,
@@ -88,6 +89,14 @@
     "ativo": true,
     "timeout_resposta_min": 120
   },
+  "correcoes_pronuncia": {
+  "eua": "estados unidos",
+  "minutos": "minutos",
+  "minuto": "minuto",
+  "min": "minuto",
+  "mins": "minutos",
+  },
+
   "max_destaques_por_bloco": 1,
   "volume_musica_fundo": 0.07,
 

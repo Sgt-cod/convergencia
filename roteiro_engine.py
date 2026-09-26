@@ -38,6 +38,7 @@ quebrar o pipeline — mesma filosofia de fallback que já existe no resto do c�
 
 import json
 import re
+import traceback
 
 # Segunda camada de defesa contra o roteiro "vazar" direção de produção pro que vira
 # fala (ex: um documento_estilo em formato de roteiro profissional, com timecode e
@@ -91,6 +92,33 @@ def sanitizar_direcoes_de_producao(texto):
     texto = " ".join(sentencas_limpas)
 
     return re.sub(r'\s{2,}', ' ', texto).strip()
+
+
+def _com_retry_estagio(nome_estagio, func, *args, tentativas=2, **kwargs):
+    """
+    Roda UM estágio da cadeia (ex: gerar_estrutura_capitulos) com uma segunda chance
+    antes de deixar a exceção propagar pra fora.
+
+    BUGFIX (fallback pra 'fallback_simples' acontecendo com frequência e pulando os
+    capítulos/curadoria via Telegram inteiros): antes, qualquer erro em QUALQUER
+    estágio — inclusive um JSON malformado pontual do Gemini, que é um problema
+    conhecidamente intermitente de LLM, não um erro sistemático — derrubava a cadeia
+    inteira pro modo de emergência de uma vez, sem chance de recuperação. A esmagadora
+    maioria desses erros não se repete numa segunda chamada (o modelo, pedido de novo,
+    normalmente devolve um JSON válido). Isso tenta de novo O MESMO estágio até
+    `tentativas` vezes antes de desistir e deixar a exceção subir pro try/except maior
+    (que aí sim cai pro roteiro de emergência sem capítulos).
+    """
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa < tentativas:
+                print(f"  ⚠️ {nome_estagio} falhou na tentativa {tentativa}/{tentativas} "
+                      f"({e}) — tentando de novo...")
+    raise ultimo_erro
 
 
 def _extrair_json(texto):
@@ -539,23 +567,32 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
 
     try:
         print("  🧱 Estágio 1/4 — estrutura em capítulos...")
-        estrutura = gerar_estrutura_capitulos(tema, contexto_nicho, idioma_conteudo,
-                                               gemini_generate_fn, num_capitulos)
+        estrutura = _com_retry_estagio(
+            "Estágio 1/4 (estrutura)", gerar_estrutura_capitulos,
+            tema, contexto_nicho, idioma_conteudo, gemini_generate_fn, num_capitulos)
 
         print("  ✍️ Estágio 2/4 — escrita...")
-        blocos = gerar_prosa_capitulos(estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
-                                        documento_estilo, palavras_alvo, gemini_generate_fn)
+        blocos = _com_retry_estagio(
+            "Estágio 2/4 (escrita)", gerar_prosa_capitulos,
+            estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
+            documento_estilo, palavras_alvo, gemini_generate_fn)
 
         print("  🔍 Estágio 3/4 — crítica adversarial...")
-        blocos = criticar_e_reescrever(blocos, idioma_conteudo, gemini_generate_fn)
+        blocos = _com_retry_estagio(
+            "Estágio 3/4 (crítica)", criticar_e_reescrever,
+            blocos, idioma_conteudo, gemini_generate_fn)
         # criticar_e_reescrever reescreve 'texto', mas 'titulo_capitulo'/'inicio_capitulo'
         # são chaves separadas no dict do bloco — sobrevivem à reescrita sem precisar
         # de nenhum reforço aqui (diferente de quando o título entrava embutido no
         # próprio texto falado, que já não é mais o caso).
 
         print("  🏷️ Estágio 4/4 — título e descrição...")
-        titulo = gerar_titulo_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn)
-        descricao = gerar_descricao_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn)
+        titulo = _com_retry_estagio(
+            "Estágio 4/4 (título)", gerar_titulo_final_simples,
+            tema, estrutura, idioma_conteudo, gemini_generate_fn)
+        descricao = _com_retry_estagio(
+            "Estágio 4/4 (descrição)", gerar_descricao_final_simples,
+            tema, estrutura, idioma_conteudo, gemini_generate_fn)
 
         roteiro_texto = " ".join(b['texto'] for b in blocos)
         capitulos_meta = [{'titulo': b['titulo_capitulo'], 'bloco': b['bloco']}
@@ -571,7 +608,14 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
             'capitulos_meta': capitulos_meta,
         }
     except Exception as e:
+        # BUGFIX: a mensagem de aviso lá em generate_video.py (quando o modo final sai
+        # 'fallback_simples') diz "veja o traceback impresso mais acima" — mas até agora
+        # nada imprimia esse traceback de fato, só a mensagem curta str(e) abaixo. Sem o
+        # traceback, não dá pra saber em qual dos 4 estágios (e em qual linha exata)
+        # a cadeia quebrou, o que torna esse tipo de falha praticamente impossível de
+        # diagnosticar a partir do log. Agora imprime de verdade.
         print(f"  ⚠️ Cadeia de capítulos falhou ({e}) — usando geração simples de emergência")
+        traceback.print_exc()
         prompt_simples = f"""Crie um roteiro de narração investigativo para um vídeo de {contexto_nicho}
 sobre "{tema}", em {idioma_conteudo}, ~{palavras_alvo} palavras, tom direto e factual.
 Escreva APENAS o roteiro corrido."""
@@ -827,18 +871,28 @@ def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
     try:
         if modo_roteiro == 'simples':
             print("  🧱 Estágio 1/4 — estrutura devocional (sem tese/objeção)...")
-            estrutura = gerar_estrutura_devocional(tema, contexto_nicho, idioma_conteudo, gemini_generate_fn)
+            estrutura = _com_retry_estagio(
+                "Estágio 1/4 (estrutura)", gerar_estrutura_devocional,
+                tema, contexto_nicho, idioma_conteudo, gemini_generate_fn)
 
             print("  ✍️ Estágio 2/4 — escrita...")
-            blocos = gerar_prosa(estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
-                                  documento_estilo, palavras_alvo, gemini_generate_fn)
+            blocos = _com_retry_estagio(
+                "Estágio 2/4 (escrita)", gerar_prosa,
+                estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
+                documento_estilo, palavras_alvo, gemini_generate_fn)
 
             print("  🔍 Estágio 3/4 — crítica adversarial...")
-            blocos = criticar_e_reescrever(blocos, idioma_conteudo, gemini_generate_fn)
+            blocos = _com_retry_estagio(
+                "Estágio 3/4 (crítica)", criticar_e_reescrever,
+                blocos, idioma_conteudo, gemini_generate_fn)
 
             print("  🏷️ Estágio 4/4 — título e descrição...")
-            titulo = gerar_titulo_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn)
-            descricao = gerar_descricao_final_simples(tema, estrutura, idioma_conteudo, gemini_generate_fn)
+            titulo = _com_retry_estagio(
+                "Estágio 4/4 (título)", gerar_titulo_final_simples,
+                tema, estrutura, idioma_conteudo, gemini_generate_fn)
+            descricao = _com_retry_estagio(
+                "Estágio 4/4 (descrição)", gerar_descricao_final_simples,
+                tema, estrutura, idioma_conteudo, gemini_generate_fn)
 
             roteiro_texto = " ".join(b['texto'] for b in blocos)
             return {
@@ -851,24 +905,36 @@ def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
             }
 
         print("  🎯 Estágio 1/5 — tese...")
-        tese_dict = gerar_tese(tema, contexto_nicho, idioma_conteudo, gemini_generate_fn)
+        tese_dict = _com_retry_estagio(
+            "Estágio 1/5 (tese)", gerar_tese,
+            tema, contexto_nicho, idioma_conteudo, gemini_generate_fn)
         if tese_dict.get('reprovar'):
             raise ValueError(f"Tese reprovada pelo próprio modelo: {tese_dict.get('tese')}")
         print(f"     tese: {tese_dict['tese']}")
 
         print("  🧱 Estágio 2/5 — estrutura argumentativa...")
-        estrutura = gerar_estrutura(tese_dict, contexto_nicho, idioma_conteudo, gemini_generate_fn)
+        estrutura = _com_retry_estagio(
+            "Estágio 2/5 (estrutura)", gerar_estrutura,
+            tese_dict, contexto_nicho, idioma_conteudo, gemini_generate_fn)
 
         print("  ✍️ Estágio 3/5 — escrita...")
-        blocos = gerar_prosa(estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
-                              documento_estilo, palavras_alvo, gemini_generate_fn)
+        blocos = _com_retry_estagio(
+            "Estágio 3/5 (escrita)", gerar_prosa,
+            estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
+            documento_estilo, palavras_alvo, gemini_generate_fn)
 
         print("  🔍 Estágio 4/5 — crítica adversarial...")
-        blocos = criticar_e_reescrever(blocos, idioma_conteudo, gemini_generate_fn)
+        blocos = _com_retry_estagio(
+            "Estágio 4/5 (crítica)", criticar_e_reescrever,
+            blocos, idioma_conteudo, gemini_generate_fn)
 
         print("  🏷️ Estágio 5/5 — título e descrição...")
-        titulo = gerar_titulo_final(tese_dict, estrutura, idioma_conteudo, gemini_generate_fn)
-        descricao = gerar_descricao_final(tese_dict, estrutura, idioma_conteudo, gemini_generate_fn)
+        titulo = _com_retry_estagio(
+            "Estágio 5/5 (título)", gerar_titulo_final,
+            tese_dict, estrutura, idioma_conteudo, gemini_generate_fn)
+        descricao = _com_retry_estagio(
+            "Estágio 5/5 (descrição)", gerar_descricao_final,
+            tese_dict, estrutura, idioma_conteudo, gemini_generate_fn)
 
         roteiro_texto = " ".join(b['texto'] for b in blocos)
 
@@ -883,6 +949,7 @@ def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
 
     except Exception as e:
         print(f"  ⚠️ Cadeia de roteiro falhou ({e}) — usando geração simples de emergência")
+        traceback.print_exc()
         prompt_simples = f"""Crie um roteiro de narração para um vídeo de {contexto_nicho} sobre "{tema}",
 em {idioma_conteudo}, ~{palavras_alvo} palavras, tom direto. Escreva APENAS o roteiro corrido."""
         resposta = gemini_generate_fn(prompt_simples)

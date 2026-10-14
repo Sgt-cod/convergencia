@@ -74,7 +74,7 @@ class WorkflowCanceladoPeloUsuario(Exception):
 
 def _config():
     try:
-        with open('config.json', 'r', encoding='utf-8') as f:
+        with open(os.environ.get('CONFIG_FILE', 'config.json'), 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception:
         return {}
@@ -139,14 +139,114 @@ def _enviar_arquivo(metodo, campo_arquivo, caminho, **params):
     return dados['result']
 
 
+def _teclado(botoes):
+    """botoes: lista de (texto, callback_data) → UMA linha; ou lista de listas → várias
+    linhas. Se callback_data começa com 'url:', vira botão de LINK (abre no navegador,
+    não gera callback pro bot)."""
+    linhas = botoes if (botoes and isinstance(botoes[0], list)) else [botoes]
+    def _b(t, d):
+        return {'text': t, 'url': d[4:]} if d.startswith('url:') else {'text': t, 'callback_data': d}
+    return json.dumps({'inline_keyboard': [[_b(t, d) for t, d in linha] for linha in linhas]})
+
+
 def enviar_texto(texto, botoes=None):
-    """botoes: lista de (texto_botao, callback_data) — vira UMA linha de botões inline."""
+    """botoes: ver _teclado()."""
     params = {'chat_id': TELEGRAM_CHAT_ID, 'text': texto}
     if botoes:
-        params['reply_markup'] = json.dumps({
-            'inline_keyboard': [[{'text': t, 'callback_data': d} for t, d in botoes]]
-        })
+        params['reply_markup'] = _teclado(botoes)
     return _chamar('sendMessage', **params)
+
+
+# ============================================================
+# Texto paralelo em PT-BR (canal em outro idioma)
+# ============================================================
+# Quando o canal narra em outro idioma (ex: norueguês) e quem opera não lê esse idioma, toda
+# mensagem que traz texto do roteiro vem com a tradução em PT-BR logo abaixo. O tradutor é
+# injetado por generate_video.py (usa o mesmo Gemini do resto do pipeline) pra este módulo
+# continuar sem dependência do Gemini. Sem tradutor configurado, tudo segue como antes.
+
+_TRADUTOR = None
+_CACHE_TRADUCAO = {}   # (texto, com_sugestao) -> {'pt','sugestao'}; o mesmo texto de segmento
+                       # é mostrado em mais de uma etapa (destaques + áudio): 1 chamada só
+
+
+def configurar_tradutor(fn):
+    """fn(textos: list[str], com_sugestao: bool) -> list[{'pt': str, 'sugestao': str|None}]"""
+    global _TRADUTOR
+    _TRADUTOR = fn
+
+
+def _traduzir(textos, com_sugestao=False):
+    """Sempre devolve uma lista do mesmo tamanho de 'textos' — itens None se a tradução
+    falhar (a revisão segue só com o texto original em vez de travar)."""
+    vazio = [{'pt': None, 'sugestao': None} for _ in textos]
+    if _TRADUTOR is None or not textos:
+        return vazio
+    try:
+        faltam = [t for t in textos if (t, com_sugestao) not in _CACHE_TRADUCAO]
+        if faltam:
+            novos = _TRADUTOR(faltam, com_sugestao)
+            if len(novos) != len(faltam):
+                raise ValueError(f"tradutor devolveu {len(novos)} itens pra {len(faltam)} textos")
+            for t, n in zip(faltam, novos):
+                _CACHE_TRADUCAO[(t, com_sugestao)] = n
+        return [_CACHE_TRADUCAO[(t, com_sugestao)] for t in textos]
+    except Exception as e:
+        print(f"  ⚠️ Tradução PT-BR indisponível ({e}) — mandando só o texto original")
+        return vazio
+
+
+def _url_busca_pexels(termo):
+    """Link de busca de VÍDEOS no site do Pexels já com os filtros do config.json
+    ('pexels_busca_telegram': {"ativo": true, "orientation": "landscape", "min_duration": 10}).
+    Os filtros vão na query string; se o site ignorar algum, a busca ainda abre normalmente."""
+    cfg = _config().get('pexels_busca_telegram', {})
+    if not cfg.get('ativo', False) or not termo:
+        return None
+    from urllib.parse import quote, urlencode
+    filtros = {}
+    if cfg.get('orientation', 'landscape'):
+        filtros['orientation'] = cfg.get('orientation', 'landscape')
+    if cfg.get('min_duration', 10):
+        filtros['min_duration'] = cfg.get('min_duration', 10)
+    url = f"https://www.pexels.com/search/videos/{quote(termo.strip(), safe='')}/"
+    return url + ('?' + urlencode(filtros) if filtros else '')
+
+
+def _quebrar_texto(texto, limite=3800):
+    """Quebra em pedaços <= limite (o Telegram recusa mensagem > 4096), preferindo fim de
+    parágrafo/frase pra nunca cortar uma palavra no meio."""
+    texto = texto.strip()
+    pedacos = []
+    while len(texto) > limite:
+        corte = max(texto.rfind('\n', 0, limite), texto.rfind('. ', 0, limite) + 1,
+                    texto.rfind('? ', 0, limite) + 1, texto.rfind('! ', 0, limite) + 1)
+        if corte <= limite // 2:
+            corte = limite
+        pedacos.append(texto[:corte].strip())
+        texto = texto[corte:].strip()
+    if texto:
+        pedacos.append(texto)
+    return pedacos
+
+
+def enviar_texto_longo(texto, cabecalho=None, botoes=None):
+    """enviar_texto() que aguenta textos acima de 4096 caracteres. 'botoes' (se houver)
+    vai só na ÚLTIMA mensagem."""
+    pedacos = _quebrar_texto(texto)
+    for i, pedaco in enumerate(pedacos):
+        topo = f"{cabecalho}\n\n" if (cabecalho and i == 0) else ""
+        ultimo = (i == len(pedacos) - 1)
+        enviar_texto(topo + pedaco, botoes=botoes if ultimo else None)
+
+
+def enviar_texto_com_traducao(texto, cabecalho_original, cabecalho_pt="🇧🇷 Tradução (só pra você entender)"):
+    """Manda o texto original (limpo, fácil de copiar) e, em mensagem separada, a tradução."""
+    enviar_texto_longo(texto, cabecalho=cabecalho_original)
+    pt = _traduzir([texto])[0]['pt']
+    if pt:
+        enviar_texto_longo(pt, cabecalho=cabecalho_pt)
+    return pt
 
 
 def enviar_midia(caminho, legenda, botoes=None):
@@ -154,9 +254,7 @@ def enviar_midia(caminho, legenda, botoes=None):
     reconhecido cai pra mensagem de texto (nunca derruba a revisão por causa disso)."""
     params = {'chat_id': TELEGRAM_CHAT_ID, 'caption': legenda[:1024]}
     if botoes:
-        params['reply_markup'] = json.dumps({
-            'inline_keyboard': [[{'text': t, 'callback_data': d} for t, d in botoes]]
-        })
+        params['reply_markup'] = _teclado(botoes)
     ext = os.path.splitext(caminho)[1].lower()
     try:
         if ext in ('.jpg', '.jpeg', '.png'):
@@ -557,14 +655,33 @@ def revisar_midia_pipeline(lista_clipes, texto_segmento, palavras_tempo, nome_se
                  f"aprovar/recusar pelos botões OU já mandar a substituição direto "
                  f"(link do Pexels ou foto/vídeo do aparelho) que eu entendo.")
 
-    for i, clipe in enumerate(lista_clipes):
-        trecho = _trecho_do_roteiro(texto_segmento, palavras_tempo,
-                                     clipe['inicio'], clipe['inicio'] + clipe['duracao'])
-        legenda = (f"Clipe {i + 1}/{len(lista_clipes)} — {clipe['duracao']:.1f}s "
-                   f"(fonte: {clipe.get('fonte', 'pexels')})\n\n\"{trecho}\"")
+    # Uma única chamada de tradução por segmento (não uma por clipe): trecho NO + PT-BR +
+    # sugestão de que mídia procurar, tudo em PT-BR pra quem opera não precisar ler o idioma.
+    trechos = [_trecho_do_roteiro(texto_segmento, palavras_tempo,
+                                  c['inicio'], c['inicio'] + c['duracao']) for c in lista_clipes]
+    traduziveis = [i for i, t in enumerate(trechos) if not t.startswith('(sobra de tempo')]
+    traducoes = [{'pt': None, 'sugestao': None, 'busca_en': None} for _ in trechos]
+    for i, t in zip(traduziveis, _traduzir([trechos[i] for i in traduziveis], com_sugestao=True)):
+        traducoes[i] = t
 
-        enviar_midia(clipe['path'], legenda,
-                     botoes=[('✅ Aprovar', 'aprovar'), ('❌ Recusar', 'recusar')])
+    for i, clipe in enumerate(lista_clipes):
+        trecho = trechos[i]
+        dur_exibida = clipe.get('duracao_exibida', clipe['duracao'])
+        legenda = (f"Clipe {i + 1}/{len(lista_clipes)} — {dur_exibida:.1f}s "
+                   f"(fonte: {clipe.get('fonte', 'pexels')})\n\n\"{trecho[:330]}\"")
+        if traducoes[i]['pt']:
+            legenda += f"\n\n🇧🇷 \"{traducoes[i]['pt'][:330]}\""
+        if traducoes[i]['sugestao']:
+            legenda += f"\n\n💡 Mídia sugerida: {traducoes[i]['sugestao'][:160]}"
+        termo_busca = traducoes[i].get('busca_en') or traducoes[i]['sugestao']
+        if termo_busca and traducoes[i].get('busca_en'):
+            legenda += f"\n🔎 Busca: {termo_busca[:80]}"
+
+        botoes_clipe = [('✅ Aprovar', 'aprovar'), ('❌ Recusar', 'recusar')]
+        url_pexels = _url_busca_pexels(termo_busca)
+        if url_pexels:
+            botoes_clipe = [botoes_clipe, [('🔎 Pesquisar no Pexels', 'url:' + url_pexels)]]
+        enviar_midia(clipe['path'], legenda, botoes=botoes_clipe)
 
         tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
 
@@ -644,7 +761,7 @@ def _normalizar_audio_para_segmento(caminho_origem, destino_mp3):
     return destino_mp3
 
 
-def perguntar_audio_customizado_telegram(nome_segmento, timeout_min=None):
+def perguntar_audio_customizado_telegram(nome_segmento, timeout_min=None, texto_segmento=None):
     """
     Chamada ANTES de gerar a narração (Fish Audio) de um segmento (introdução,
     capítulo N ou desfecho): pergunta se você quer mandar seu PRÓPRIO áudio pra
@@ -660,31 +777,65 @@ def perguntar_audio_customizado_telegram(nome_segmento, timeout_min=None):
     caminho); o pipeline só aplica as margens de silêncio antes/depois do
     segmento, exatamente como já faz com a narração gerada automaticamente.
 
+    texto_segmento (opcional): o texto que deve ser narrado. Quando vem, é mandado ANTES
+    da pergunta, limpo e fácil de copiar pro seu gerador de voz, seguido da tradução em
+    PT-BR (se houver tradutor configurado) — necessário quando o canal narra num idioma
+    que você não lê.
+
+    config.json -> 'audio_customizado_telegram': {"obrigatorio": true} remove o botão
+    "Gerar automático": o áudio passa a ser a ÚNICA opção, e sem resposta no timeout o
+    workflow é CANCELADO (WorkflowCanceladoPeloUsuario) em vez de publicar um vídeo com
+    voz de fallback num idioma onde ela não foi pensada.
+
     Devolve o CAMINHO do mp3 já convertido, ou None se você decidir não mandar
     (ou não responder a tempo — nesse caso segue com TTS normal, não trava o
-    pipeline esperando).
+    pipeline esperando; exceto no modo obrigatório, descrito acima).
     """
     if not ATIVA_TELEGRAM:
         return None
+    cfg_audio = _config().get('audio_customizado_telegram', {})
+    obrigatorio = bool(cfg_audio.get('obrigatorio', False))
     if timeout_min is None:
         timeout_min = _timeout_min('audio_customizado_telegram', 15)
 
     limpar_filas_pendentes()
-    enviar_texto(
-        f"🎙️ Segmento \"{nome_segmento}\": quer mandar seu PRÓPRIO áudio pra esse "
-        f"trecho, em vez de eu gerar a narração? Pode ser nota de voz ou arquivo "
-        f"de áudio.",
-        botoes=[('🎙️ Vou mandar', 'vou_mandar'), ('🤖 Gerar automático', 'automatico')]
-    )
+
+    if texto_segmento:
+        enviar_texto_com_traducao(
+            texto_segmento,
+            cabecalho_original=f"🎙️ Texto do segmento \"{nome_segmento}\" — copie pro seu gerador de voz:")
+
+    if obrigatorio:
+        enviar_texto(
+            f"🎙️ Segmento \"{nome_segmento}\": mande o ÁUDIO desse texto (nota de voz ou "
+            f"arquivo de áudio). O vídeo só segue depois que o áudio chegar.",
+            botoes=[('🚫 Cancelar workflow', 'cancelar')]
+        )
+    else:
+        enviar_texto(
+            f"🎙️ Segmento \"{nome_segmento}\": quer mandar seu PRÓPRIO áudio pra esse "
+            f"trecho, em vez de eu gerar a narração? Pode ser nota de voz ou arquivo "
+            f"de áudio.",
+            botoes=[('🎙️ Vou mandar', 'vou_mandar'), ('🤖 Gerar automático', 'automatico')]
+        )
 
     while True:
         tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
 
         if tipo is None:
+            if obrigatorio:
+                enviar_texto(f"⏱️ Sem áudio em {timeout_min} min — workflow cancelado, nada foi publicado.")
+                raise WorkflowCanceladoPeloUsuario(
+                    f"Sem áudio recebido pro segmento '{nome_segmento}' em {timeout_min} min")
             print(f"    ⏱️ Sem resposta em {timeout_min} min — gerando narração automática")
             return None
 
-        if tipo == 'callback' and valor == 'automatico':
+        if tipo == 'callback' and valor == 'cancelar':
+            enviar_texto("🚫 Workflow cancelado. Nenhum vídeo será publicado.")
+            raise WorkflowCanceladoPeloUsuario(
+                f"Cancelado pelo usuário no áudio do segmento '{nome_segmento}'")
+
+        if tipo == 'callback' and valor == 'automatico' and not obrigatorio:
             print("    🤖 Optou por narração automática pra este segmento")
             return None
 
@@ -698,15 +849,16 @@ def perguntar_audio_customizado_telegram(nome_segmento, timeout_min=None):
             try:
                 _normalizar_audio_para_segmento(valor['caminho'], destino_mp3)
             except Exception as e:
-                enviar_texto(f"⚠️ Não consegui processar esse áudio ({e}). Manda de novo, "
-                             f"ou aperta 🤖 Gerar automático.")
+                enviar_texto(f"⚠️ Não consegui processar esse áudio ({e}). Manda de novo"
+                             + ("." if obrigatorio else ", ou aperta 🤖 Gerar automático."))
                 continue
             print(f"    🎙️ Áudio próprio recebido pra '{nome_segmento}'")
+            enviar_texto(f"✅ Áudio de \"{nome_segmento}\" recebido.")
             return destino_mp3
 
         # texto solto, foto, vídeo ou documento não servem de áudio
         enviar_texto("⚠️ Preciso de um ÁUDIO (nota de voz ou arquivo de áudio). Manda de "
-                     "novo, ou aperta 🤖 Gerar automático pra eu gerar a narração.")
+                     "novo" + ("." if obrigatorio else ", ou aperta 🤖 Gerar automático pra eu gerar a narração."))
 
 
 # ============================================================
@@ -727,13 +879,14 @@ def escolher_destaques_telegram(texto_segmento, nome_segmento, timeout_min=None)
     if timeout_min is None:
         timeout_min = _timeout_min('destaques_telegram', 15)
 
-    texto_exibicao = texto_segmento if len(texto_segmento) <= 3500 else texto_segmento[:3500] + " (…)"
+    enviar_texto_com_traducao(
+        texto_segmento,
+        cabecalho_original=f"✨ Segmento \"{nome_segmento}\" — texto original (copie as expressões daqui):")
     enviar_texto(
-        f"✨ Segmento \"{nome_segmento}\" — quais palavras/expressões quer destacar?\n\n"
-        f"{texto_exibicao}\n\n"
-        f"Responda com uma expressão POR LINHA, EXATAMENTE como está escrita acima "
-        f"(1 a 3 palavras cada, é assim que vão aparecer na tela). Ou aperta o botão "
-        f"pra deixar o Gemini escolher automático.",
+        "Quais palavras/expressões quer destacar? Responda com uma expressão POR LINHA, "
+        "EXATAMENTE como está escrita no texto acima (1 a 3 palavras cada, é assim que "
+        "vão aparecer na tela) — copie e cole do texto original, não da tradução. "
+        "Ou aperta o botão pra deixar o Gemini escolher automático.",
         botoes=[('🤖 Automático', 'automatico')]
     )
 
@@ -777,7 +930,7 @@ def _ajustar_thumbnail_16x9(caminho, largura=1280, altura=720):
     return caminho
 
 
-def revisar_thumbnail_telegram(thumbnail_path, timeout_min=None):
+def revisar_thumbnail_telegram(thumbnail_path, timeout_min=None, legenda_extra=""):
     """
     Chamada logo depois de gerar_thumbnail() e ANTES de fazer_upload_youtube(): manda
     a thumbnail gerada com [✅ Aprovar]/[📤 Enviar outra]. Pode responder de dois
@@ -801,7 +954,8 @@ def revisar_thumbnail_telegram(thumbnail_path, timeout_min=None):
     print(f"  📲 Aprovação de thumbnail via Telegram (timeout {timeout_min} min)...")
 
     caminho_atual = thumbnail_path
-    enviar_midia(caminho_atual, "🖼️ Thumbnail gerada — aprovar ou mandar outra?",
+    sufixo = f"\n\n{legenda_extra}" if legenda_extra else ""
+    enviar_midia(caminho_atual, "🖼️ Thumbnail gerada — aprovar ou mandar outra?" + sufixo,
                  botoes=[('✅ Aprovar', 'aprovar'), ('📤 Enviar outra', 'substituir')])
 
     while True:
@@ -822,13 +976,112 @@ def revisar_thumbnail_telegram(thumbnail_path, timeout_min=None):
         if tipo == 'mensagem' and valor['tipo'] == 'foto':
             caminho_atual = _ajustar_thumbnail_16x9(valor['caminho'])
             print("    📤 Thumbnail substituída pela recebida no Telegram")
-            enviar_midia(caminho_atual, "🖼️ Nova thumbnail — aprovar ou mandar outra?",
+            enviar_midia(caminho_atual, "🖼️ Nova thumbnail — aprovar ou mandar outra?" + sufixo,
                          botoes=[('✅ Aprovar', 'aprovar'), ('📤 Enviar outra', 'substituir')])
             continue
 
         # texto solto, vídeo ou documento não servem de thumbnail
         enviar_texto("⚠️ Preciso de uma FOTO (jpg/png) pra usar como thumbnail. Manda de novo, "
                      "ou aperta ✅ Aprovar pra manter a atual.")
+
+
+def escolher_formato_telegram(timeout_min=None):
+    """
+    Primeira pergunta da interação: qual a ESTRUTURA do vídeo.
+      • 📽️ Webdoc: introdução → capítulos → desfecho, com card preto entre capítulos
+      • 🔢 Lista ("10 motos que...", "7 comidas que..."): introdução → itens numerados →
+        desfecho, com um card de número + nome do item sobre a mídia (sem tela preta)
+
+    Pra lista, pergunta também: quantos itens, a ordem (regressiva N→1 ou crescente 1→N) e
+    quem escolhe os NOMES dos itens (o pipeline/Gemini, ou você digitando um por linha).
+
+    Devolve {'formato': 'webdoc'} ou
+            {'formato': 'lista', 'num_itens': N, 'ordem': 'regressiva'|'crescente',
+             'itens': [nomes] | None}
+    Timeout/sem Telegram → o formato padrão do config ('formato_video_telegram' →
+    'formato_padrao', normalmente 'webdoc'), então o workflow nunca trava esperando.
+    """
+    cfg = _config().get('formato_video_telegram', {})
+    padrao = {'formato': cfg.get('formato_padrao', 'webdoc')}
+    if not ATIVA_TELEGRAM or not cfg.get('ativo', False):
+        return padrao
+    if timeout_min is None:
+        timeout_min = _timeout_min('formato_video_telegram', 10)
+    espera = timeout_min * 60
+
+    def _perguntar_botoes(texto, botoes):
+        enviar_texto(texto, botoes=botoes)
+        while True:
+            tipo, valor = _aguardar_callback_ou_midia(timeout_s=espera)
+            if tipo is None:
+                return None
+            if tipo == 'callback':
+                return valor
+
+    limpar_filas_pendentes()
+    escolha = _perguntar_botoes("🎬 Qual a estrutura do vídeo?",
+                                [('📽️ Webdoc (capítulos)', 'webdoc'), ('🔢 Lista (itens numerados)', 'lista')])
+    if escolha != 'lista':
+        enviar_texto("👍 Formato: webdoc (introdução → capítulos → desfecho).")
+        return {'formato': 'webdoc'} if escolha == 'webdoc' else padrao
+
+    # ── quantos itens ──
+    enviar_texto("🔢 Quantos itens na lista? Toque num número ou digite (de 3 a 30).",
+                 botoes=[('5', 'n:5'), ('7', 'n:7'), ('10', 'n:10')])
+    num_itens = None
+    while num_itens is None:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=espera)
+        if tipo is None:
+            num_itens = 7
+        elif tipo == 'callback' and valor.startswith('n:'):
+            num_itens = int(valor[2:])
+        elif tipo == 'mensagem' and valor['tipo'] == 'texto' and valor['texto'].isdigit() \
+                and 3 <= int(valor['texto']) <= 30:
+            num_itens = int(valor['texto'])
+        elif tipo == 'mensagem':
+            enviar_texto("⚠️ Manda só um número de 3 a 30, ou toque num botão.")
+
+    # ── ordem ──
+    escolha = _perguntar_botoes(
+        f"↕️ Ordem dos {num_itens} itens?",
+        [(f'⬇️ Regressiva ({num_itens}→1)', 'regressiva'), (f'⬆️ Crescente (1→{num_itens})', 'crescente')])
+    ordem = escolha if escolha in ('regressiva', 'crescente') else 'regressiva'
+
+    # ── nomes dos itens ──
+    escolha = _perguntar_botoes("📝 Quem escolhe os itens da lista?",
+                                [('🤖 Você escolhe', 'pipeline'), ('✍️ Eu escolho', 'eu')])
+    itens, notas = None, None
+    if escolha == 'eu':
+        enviar_texto(
+            "✍️ Mande os itens, UM POR LINHA, na ORDEM em que vão APARECER no vídeo "
+            f"(a primeira linha aparece primeiro" +
+            (f", e vai ganhar o número {num_itens})." if ordem == 'regressiva' else ", e vai ganhar o número 1).") +
+            "\nDica: se o item for pouco conhecido, acrescente uma nota depois de ' | ' pra eu não "
+            "inventar nada. Ex: BonBon Hurlumhej Mix | mix de balas dinamarquês vendido a granel"
+            "\nSe mandar uma quantidade diferente de linhas, uso a quantidade que você mandar.",
+            botoes=[('🤖 Deixa que eu escolho', 'pipeline')])
+        while True:
+            tipo, valor = _aguardar_callback_ou_midia(timeout_s=espera)
+            if tipo is None or (tipo == 'callback' and valor == 'pipeline'):
+                break
+            if tipo == 'mensagem' and valor['tipo'] == 'texto':
+                linhas = [re.sub(r'^\s*(?:\d+\s*[.):\-]\s*|[-•*]\s*)', '', l).strip()
+                          for l in valor['texto'].splitlines()]
+                linhas = [l for l in linhas if l]
+                if 3 <= len(linhas) <= 30:
+                    itens = [l.split('|', 1)[0].strip() for l in linhas]
+                    notas = [(l.split('|', 1)[1].strip() if '|' in l else None) for l in linhas]
+                    num_itens = len(linhas)
+                    break
+                enviar_texto("⚠️ Preciso de 3 a 30 itens, um por linha.")
+            elif tipo == 'mensagem':
+                enviar_texto("⚠️ Preciso dos nomes em texto, um por linha.")
+
+    resumo = (f"👍 Lista de {num_itens} itens, ordem {ordem}, " +
+              ("itens escolhidos por você:\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(itens))
+               if itens else "itens escolhidos pelo pipeline."))
+    enviar_texto(resumo)
+    return {'formato': 'lista', 'num_itens': num_itens, 'ordem': ordem, 'itens': itens, 'notas': notas}
 
 
 def escolher_tema_telegram(timeout_min=None):
@@ -872,3 +1125,135 @@ def escolher_tema_telegram(timeout_min=None):
 
     print(f"  ⏱️ Sem resposta de tema em {timeout_min} min — escolhendo automaticamente")
     return None
+
+
+# ============================================================
+# Publicação: agora ou agendada
+# ============================================================
+
+def _parse_data_hora(texto, tz, agora=None):
+    """
+    Interpreta a data/hora digitada no Telegram, no fuso 'tz' (zoneinfo). Aceita:
+      "25/12 18:30" · "25/12/2026 18:30" · "amanhã 19:00" · "hoje 21h" · "18:30" · "18h"
+    Hora sozinha = hoje, ou amanhã se já passou. Devolve datetime com fuso, ou None se
+    não entendeu (quem chama pede de novo — nunca adivinha uma data).
+    """
+    from datetime import datetime, timedelta
+    t = texto.strip().lower().replace('às', ' ').replace('as ', ' ')
+    t = re.sub(r'\s+', ' ', t)
+    agora = agora or datetime.now(tz)
+
+    m_hora = re.search(r'(\d{1,2})\s*(?:[:h]\s*(\d{2})?)\s*$', t)
+    if not m_hora:
+        return None
+    h, mi = int(m_hora.group(1)), int(m_hora.group(2) or 0)
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    resto = t[:m_hora.start()].strip()
+
+    base = None
+    if resto in ('', 'hoje'):
+        base = agora
+    elif resto in ('amanhã', 'amanha'):
+        base = agora + timedelta(days=1)
+    else:
+        m = re.fullmatch(r'(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?', resto)
+        if not m:
+            return None
+        dia, mes = int(m.group(1)), int(m.group(2))
+        ano = int(m.group(3)) if m.group(3) else agora.year
+        if ano < 100:
+            ano += 2000
+        try:
+            base = datetime(ano, mes, dia, tzinfo=tz)
+            if not m.group(3) and base.date() < agora.date():
+                base = datetime(ano + 1, mes, dia, tzinfo=tz)  # "03/01" dito em dezembro = ano que vem
+        except ValueError:
+            return None
+    try:
+        alvo = datetime(base.year, base.month, base.day, h, mi, tzinfo=tz)
+    except ValueError:
+        return None
+    if resto == '' and alvo <= agora:
+        alvo += timedelta(days=1)
+    return alvo
+
+
+def escolher_publicacao_telegram(timeout_min=None):
+    """
+    Chamada depois da aprovação da thumbnail e ANTES do upload: pergunta se o vídeo vai ao
+    ar agora ou agendado. Devolve um datetime (UTC) pra agendar, ou None pra publicar já.
+    O agendamento usa o recurso nativo do YouTube (vídeo sobe privado e vira público sozinho
+    na hora marcada) — o workflow NÃO fica esperando até lá.
+
+    config.json -> 'agendamento_telegram': {
+        "ativo": true, "fuso_horario": "America/Sao_Paulo",     # fuso em que VOCÊ digita
+        "fuso_exibicao_extra": "Europe/Oslo",                     # opcional: mostra também esse horário
+        "se_sem_resposta": "agora",                               # ou "cancelar"
+        "timeout_resposta_min": 60 }
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    if not ATIVA_TELEGRAM:
+        return None
+    cfg = _config().get('agendamento_telegram', {})
+    if not cfg.get('ativo', False):
+        return None
+    if timeout_min is None:
+        timeout_min = _timeout_min('agendamento_telegram', 60)
+    tz = ZoneInfo(cfg.get('fuso_horario', 'America/Sao_Paulo'))
+    tz_extra = ZoneInfo(cfg['fuso_exibicao_extra']) if cfg.get('fuso_exibicao_extra') else None
+    sem_resposta = cfg.get('se_sem_resposta', 'agora')
+
+    def _fmt(dt):
+        txt = dt.astimezone(tz).strftime('%d/%m/%Y às %H:%M') + f" ({tz.key})"
+        if tz_extra:
+            txt += "\n   = " + dt.astimezone(tz_extra).strftime('%d/%m/%Y às %H:%M') + f" ({tz_extra.key})"
+        return txt
+
+    instrucao = ("Manda dia e hora, no seu horário (" + tz.key + "). Exemplos:\n"
+                 "• 25/12 18:30\n• amanhã 19:00\n• hoje 21h\n• 18:30 (hoje, ou amanhã se já passou)")
+
+    limpar_filas_pendentes()
+    enviar_texto("📅 Quando publicar o vídeo?",
+                 botoes=[('🚀 Publicar agora', 'agora'), ('📅 Agendar', 'agendar')])
+
+    candidato = None
+    while True:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+
+        if tipo is None:
+            if sem_resposta == 'cancelar':
+                enviar_texto(f"⏱️ Sem resposta em {timeout_min} min — workflow cancelado, nada foi publicado.")
+                raise WorkflowCanceladoPeloUsuario("Sem decisão de publicação no Telegram")
+            enviar_texto(f"⏱️ Sem resposta em {timeout_min} min — publicando agora.")
+            return None
+
+        if tipo == 'callback' and valor == 'agora':
+            return None
+
+        if tipo == 'callback' and valor == 'confirmar' and candidato:
+            enviar_texto(f"✅ Agendado para {_fmt(candidato)}.")
+            return candidato.astimezone(timezone.utc)
+
+        if tipo == 'callback' and valor in ('agendar', 'alterar'):
+            candidato = None
+            enviar_texto(instrucao)
+            continue
+
+        if tipo == 'mensagem' and valor['tipo'] == 'texto':
+            alvo = _parse_data_hora(valor['texto'], tz)
+            if alvo is None:
+                enviar_texto("⚠️ Não entendi essa data/hora. " + instrucao)
+                continue
+            if alvo < datetime.now(tz) + timedelta(minutes=15):
+                enviar_texto("⚠️ Essa hora já passou ou está a menos de 15 min. Manda uma data futura.")
+                continue
+            candidato = alvo
+            enviar_texto(f"Agendar o vídeo para:\n{_fmt(alvo)}?",
+                         botoes=[('✅ Confirmar', 'confirmar'), ('✏️ Alterar', 'alterar'),
+                                 ('🚀 Agora', 'agora')])
+            continue
+
+        enviar_texto("⚠️ Preciso de uma data e hora em texto, ou use os botões.")

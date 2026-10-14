@@ -26,6 +26,24 @@ Três peças, nessa ordem de uso no generate_video.py:
 import json
 import re
 
+# ── Contexto de país/idioma por canal (preenchido por generate_video.py via configurar_pais) ──
+# Os padrões abaixo reproduzem EXATAMENTE o comportamento original (canal brasileiro).
+_PAIS = {
+    'idioma': 'português do Brasil',
+    'nome': 'Brasil',
+    'nome_busca': 'brazil',                       # como aparece nos termos em inglês do Pexels
+    'exemplo_termo_marcado': 'bank notes brazilian real',
+    'exemplo_termo_generico': 'money counting hands close up',
+    'exemplo_lugar': 'Petrópolis Brasil',
+    'exemplo_moeda': 'cédula Real brasileiro',
+}
+
+
+def configurar_pais(**kwargs):
+    for k, v in kwargs.items():
+        if k in _PAIS and v:
+            _PAIS[k] = v
+
 
 def _corrigir_metro_quadrado(m):
     """Callback do regex abaixo: recompõe 'metro(s)' preservando maiúscula inicial
@@ -132,13 +150,13 @@ Prefira variar entre blocos diferentes — só repita o mesmo termo em dois bloc
 genuinamente não houver opção melhor pra um deles.
 
 IMPORTANTE — evite ambiguidade de país: essa é uma busca de banco de imagens GLOBAL
-(Pexels), sem filtro de país. Um termo genérico como "money counting hands close up"
+(Pexels), sem filtro de país. Um termo genérico como "{_PAIS['exemplo_termo_generico']}"
 ou "office workers meeting" pode voltar imagem/vídeo de QUALQUER lugar do mundo — já
-aconteceu de um bloco sobre investimento no Brasil vir ilustrado com cédula de outro
-país só porque o termo escolhido não tinha "brazil"/"brasil" nele. Por isso: se a
+aconteceu de um bloco sobre o país do público vir ilustrado com cédula/cenário de outro
+país só porque o termo escolhido não tinha "{_PAIS['nome_busca']}" nele. Por isso: se a
 lista pré-aprovada tiver DUAS opções pro mesmo conceito, uma com país marcado (ex:
-"bank notes brazilian real") e outra genérica (ex: "money counting hands close up"),
-e o bloco menciona ou implica o Brasil, escolha SEMPRE a versão com país marcado. Só
+"{_PAIS['exemplo_termo_marcado']}") e outra genérica (ex: "{_PAIS['exemplo_termo_generico']}"),
+e o bloco menciona ou implica {_PAIS['nome']}, escolha SEMPRE a versão com país marcado. Só
 use a genérica se não houver NENHUMA versão com país marcado pra aquele conceito.
 
 LISTA PRÉ-APROVADA:
@@ -200,11 +218,12 @@ Commons, então precisa ser algo que provavelmente TEM foto lá (lugar/evento/in
 real e razoavelmente conhecido) — não invente, não force se o bloco não tiver nada assim.
 
 IMPORTANTE — sempre inclua o PAÍS/região no termo quando fizer sentido, mesmo que o
-bloco não repita a palavra "Brasil" explicitamente (ex: se o bloco fala de uma cidade
-brasileira específica, escreva "Petrópolis Brasil", não só "Petrópolis"; se fala de
-"investimento federal" ou "verba pública" nesse contexto, escreva "cédula Real
-brasileiro", não só "dinheiro" ou "moeda"). Sem essa marcação de país, a busca corre o
-risco de achar imagem de outro lugar/moeda que só parece certa por acaso.
+bloco não repita o nome do país explicitamente (ex: se o bloco fala de um lugar específico
+de {_PAIS['nome']}, escreva "{_PAIS['exemplo_lugar']}", não só o nome do lugar; se fala de
+verba/dinheiro nesse contexto, escreva "{_PAIS['exemplo_moeda']}", não só "dinheiro" ou
+"moeda"). Sem essa marcação de país, a busca corre o risco de achar imagem de outro
+lugar/moeda que só parece certa por acaso. O termo pode ficar no idioma local OU em
+inglês — o que provavelmente tem foto no Wikimedia Commons.
 
 Se o bloco for genérico (reflexão, transição, sem menção específica), retorne null
 pra ele.
@@ -269,7 +288,8 @@ capítulo trata de um fato concreto, não é exceção rara.
 BLOCOS:
 {blocos_prompt}
 
-Para cada bloco escolhido, escreva:
+Para cada bloco escolhido, escreva EM {_PAIS['idioma']} (manchete, corpo e trecho_destaque;
+só o JSON e as chaves ficam como estão):
 - "manchete": título curto (até 12 palavras, estilo jornal), pode usar maiúscula só na
   primeira palavra e em nomes próprios (não precisa ser tudo em caixa alta)
 - "corpo": um parágrafo de 3 a 4 frases (35-55 palavras), no estilo de matéria de

@@ -40,6 +40,42 @@ import json
 import re
 import traceback
 
+from numeros_extenso import normalizar_texto_para_tts, contem_digitos
+
+# ── Configuração por canal (preenchida por generate_video.py a partir do config.json) ──
+# Sem chamar configurar(), tudo abaixo fica inerte e o comportamento é o de sempre.
+_CFG = {
+    'idioma_numeros': None,   # 'no' liga a normalização determinística de números/abreviações
+    'regra_numeros': '',      # texto da regra injetada nos prompts de escrita/reescrita
+    'nota_publico': '',       # nota sobre público/país injetada nos prompts de estrutura/escrita
+    'chars_min': None,        # alvo de tamanho do roteiro INTEIRO, em caracteres (com espaços)
+    'chars_max': None,
+    'chars_por_palavra': 6.2, # média (com espaço) usada só pra converter alvo de chars em palavras
+}
+
+
+def configurar(**kwargs):
+    """Chamado uma vez por generate_video.py. Chaves desconhecidas são ignoradas."""
+    for k, v in kwargs.items():
+        if k in _CFG and v is not None:
+            _CFG[k] = v
+
+
+def _regra_numeros():
+    return f"\n- {_CFG['regra_numeros']}" if _CFG['regra_numeros'] else ""
+
+
+def _nota_publico():
+    return f"\n{_CFG['nota_publico']}\n" if _CFG['nota_publico'] else ""
+
+
+def _pos_processar_texto(texto):
+    """Rede de segurança: tira dígitos/abreviações/pontuação solta que escaparam do prompt.
+    Só age se configurar(idioma_numeros=...) foi chamado."""
+    if _CFG['idioma_numeros']:
+        return normalizar_texto_para_tts(texto, _CFG['idioma_numeros'])
+    return texto
+
 # Segunda camada de defesa contra o roteiro "vazar" direção de produção pro que vira
 # fala (ex: um documento_estilo em formato de roteiro profissional, com timecode e
 # indicação de trilha/efeito sonoro, sendo copiado literalmente pelo Gemini em vez de
@@ -264,8 +300,8 @@ REGRAS OBRIGATÓRIAS:
   bloco. NUNCA invente uma abreviação curta (tipo uma letra ou duas) pra evitar repetir
   um termo — se precisar variar, troque por uma expressão equivalente por extenso
   ("o país", "a potência norte-americana", "o mercado americano"), nunca por uma sigla
-  ou código{linha_extra}
-
+  ou código{_regra_numeros()}{linha_extra}
+{_nota_publico()}
 Retorne APENAS JSON:
 {{
   "blocos": [
@@ -282,7 +318,7 @@ Retorne APENAS JSON:
         b['texto'] = re.sub(r'\*+', '', b['texto'])
         b['texto'] = b['texto'].replace('#', '').replace('_', '').strip()
         b['texto'] = padrao_prefixo.sub('', b['texto']).strip()
-        b['texto'] = sanitizar_direcoes_de_producao(b['texto'])
+        b['texto'] = _pos_processar_texto(sanitizar_direcoes_de_producao(b['texto']))
 
     total_palavras = sum(len(b['texto'].split()) for b in blocos)
     if total_palavras < palavras_alvo * 0.85:
@@ -344,7 +380,8 @@ Escreva em {idioma_conteudo}.
 
 REGRAS: nunca use siglas/abreviações pra país/órgão/instituição (escreva por extenso,
 ex: "Estados Unidos", nunca "EUA" ou qualquer código curto) — o texto vai pra um TTS
-que lê tudo literalmente. "texto_novo" deve ser só o texto puro que vai ser narrado,
+que lê tudo literalmente.{_regra_numeros()}
+"texto_novo" deve ser só o texto puro que vai ser narrado,
 sem o prefixo "[n] (bloco):" usado acima, sem colchetes, sem marcação técnica de
 produção (timecode, trilha, SFX, rótulo de locutor).
 
@@ -366,7 +403,7 @@ Retorne APENAS JSON: {{"expansoes": [{{"indice": 0, "texto_novo": "..."}}]}}"""
             texto_novo = re.sub(r'\*+', '', exp['texto_novo'])
             texto_novo = texto_novo.replace('#', '').replace('_', '').strip()
             texto_novo = padrao_prefixo.sub('', texto_novo).strip()
-            texto_novo = sanitizar_direcoes_de_producao(texto_novo)
+            texto_novo = _pos_processar_texto(sanitizar_direcoes_de_producao(texto_novo))
             # Só aceita se de fato ficou mais longo que o texto atual — nunca troca por
             # algo mais curto ou igual (isso indicaria que o modelo não expandiu nada).
             if len(texto_novo.split()) > len(blocos[i]['texto'].split()):
@@ -376,6 +413,104 @@ Retorne APENAS JSON: {{"expansoes": [{{"indice": 0, "texto_novo": "..."}}]}}"""
         if not houve_ganho:
             break
 
+    return blocos
+
+
+# ============================================================
+# AJUSTE DE TAMANHO POR CARACTERES (alvo do roteiro INTEIRO, ex: 6000–7000)
+# ============================================================
+
+def _total_chars(blocos):
+    return len(" ".join(b['texto'] for b in blocos))
+
+
+def _cortar_frases_excedentes(blocos, chars_max):
+    """Último recurso quando o Gemini não conseguiu encurtar: remove a ÚLTIMA frase do
+    maior bloco do MEIO (nunca a introdução nem o desfecho, que carregam abertura e
+    pergunta final) até caber. Só roda se, mesmo após as reescritas, ainda estourar."""
+    candidatos = list(range(1, len(blocos) - 1)) if len(blocos) > 2 else list(range(len(blocos)))
+    cortes = 0
+    while _total_chars(blocos) > chars_max:
+        elegiveis = [i for i in candidatos
+                     if len(re.split(r'(?<=[.!?])\s+', blocos[i]['texto'].strip())) > 3]
+        if not elegiveis:
+            break
+        i = max(elegiveis, key=lambda k: len(blocos[k]['texto']))
+        frases = re.split(r'(?<=[.!?])\s+', blocos[i]['texto'].strip())
+        blocos[i]['texto'] = " ".join(frases[:-1])
+        cortes += 1
+    if cortes:
+        print(f"  ✂️ Corte de emergência: {cortes} frase(s) removida(s) dos blocos do meio pra caber no limite")
+    return blocos
+
+
+def ajustar_tamanho_por_caracteres(blocos, idioma_conteudo, gemini_generate_fn, tentativas=3):
+    """
+    O prompt pede um nº de PALAVRAS, mas o alvo real é em CARACTERES (config
+    'caracteres_alvo_min/max'). Palavras em norueguês variam muito de tamanho (compostos),
+    então a conversão palavras→caracteres erra com frequência — por isso aqui o tamanho é
+    MEDIDO no texto final (já com números por extenso) e, se estiver fora da faixa, os
+    blocos voltam pro Gemini com uma meta de caracteres por bloco, proporcional.
+    """
+    cmin, cmax = _CFG['chars_min'], _CFG['chars_max']
+    if not cmin or not cmax:
+        return blocos
+    alvo = (cmin + cmax) // 2
+    padrao_prefixo = re.compile(r'^\s*\[\d+\]\s*\([^)]*\)\s*:\s*')
+
+    for rodada in range(1, tentativas + 1):
+        total = _total_chars(blocos)
+        if cmin <= total <= cmax:
+            print(f"  📏 Roteiro com {total} caracteres — dentro da faixa {cmin}–{cmax} ✅")
+            return blocos
+
+        fator = alvo / max(total, 1)
+        acao = "ENCURTE" if total > cmax else "DESENVOLVA MAIS"
+        print(f"  📏 Roteiro com {total} caracteres (faixa {cmin}–{cmax}) — rodada {rodada}/{tentativas}: {acao.lower()}...")
+        metas = {i: round(len(b['texto']) * fator) for i, b in enumerate(blocos)}
+        trechos = "\n".join(
+            f"[{i}] ({b['bloco']}, {len(b['texto'])} caracteres, META ~{metas[i]} caracteres): {b['texto']}"
+            for i, b in enumerate(blocos)
+        )
+        prompt = f"""{acao} cada bloco do roteiro abaixo até chegar perto da META de caracteres
+indicada (contando espaços). Mantenha o mesmo sentido, a mesma voz e TODOS os fatos
+importantes; ao encurtar, corte repetição e floreio, nunca o dado concreto nem a pergunta
+final; ao desenvolver, acrescente fato/exemplo concreto, nunca frase genérica. Escreva em
+{idioma_conteudo}. A meta é aproximada: erre por menos de 5%.
+
+{trechos}
+
+REGRAS: texto 100% falável (sem marcação de produção, sem colchetes); nenhuma sigla; sem
+travessão solto.{_regra_numeros()}
+"texto_novo" é só o texto puro do bloco, sem o prefixo "[n] (bloco):".
+
+Retorne APENAS JSON com TODOS os blocos: {{"reescritas": [{{"indice": 0, "texto_novo": "..."}}]}}"""
+
+        try:
+            reescritas = _extrair_json(gemini_generate_fn(prompt).text).get('reescritas', [])
+        except Exception as e:
+            print(f"  ⚠️ Ajuste de tamanho falhou ({e}) — mantendo texto atual")
+            break
+
+        for r in reescritas:
+            i = r.get('indice')
+            if not (isinstance(i, int) and 0 <= i < len(blocos) and r.get('texto_novo')):
+                continue
+            novo = padrao_prefixo.sub('', re.sub(r'\*+', '', r['texto_novo']).strip())
+            novo = _pos_processar_texto(sanitizar_direcoes_de_producao(novo.replace('#', '').strip()))
+            # só aceita se chegou MAIS PERTO da meta do bloco que o texto anterior
+            if novo and abs(len(novo) - metas[i]) < abs(len(blocos[i]['texto']) - metas[i]):
+                blocos[i]['texto'] = novo
+
+    total = _total_chars(blocos)
+    if total > cmax:
+        blocos = _cortar_frases_excedentes(blocos, cmax)
+        total = _total_chars(blocos)
+    if total < cmin:
+        print(f"  ⚠️ Roteiro ficou com {total} caracteres, abaixo do mínimo de {cmin} — "
+              f"o vídeo sairá um pouco mais curto que o pedido.")
+    else:
+        print(f"  📏 Roteiro final com {total} caracteres.")
     return blocos
 
 
@@ -440,7 +575,7 @@ como "Elementar" no YouTube). NÃO escreva prosa ainda — apenas o esqueleto, e
 
 NICHO: {contexto_nicho}
 TEMA: "{tema}"
-
+{_nota_publico()}
 A diferença entre um webdoc investigativo de verdade e um resumo genérico é esta: o
 webdoc ANCORA a explicação abstrata em UM CASO CONCRETO — data, número, nome de lugar
 ou instituição — e usa esse caso como fio condutor que atravessa o vídeo inteiro, não
@@ -495,8 +630,99 @@ Retorne APENAS JSON:
     return _extrair_json(resposta.text)
 
 
+def _norm_titulo(t):
+    return re.sub(r'\W+', ' ', (t or '').lower()).strip()
+
+
+def gerar_estrutura_lista(tema, contexto_nicho, idioma_conteudo, gemini_generate_fn,
+                          num_itens=7, itens_fornecidos=None, ordem='regressiva',
+                          notas_itens=None):
+    """
+    Estrutura de vídeo em LISTA ("10 motos que...", "7 comidas que..."): introdução → N itens
+    → desfecho. Devolve o MESMO formato de gerar_estrutura_capitulos (chave 'capitulos' =
+    os itens; 'caso_ancoragem' = o critério da lista), então toda a escrita/crítica/ajuste
+    de tamanho/montagem reaproveita o pipeline dos capítulos sem mudança.
+
+    itens_fornecidos: nomes de itens escolhidos pelo usuário (na ORDEM em que aparecem no
+    vídeo). Se vier, o Gemini NÃO inventa/renomeia — só escreve o que cada item cobre.
+    ordem: 'regressiva' (N→1, o último item mostrado é o nº 1) ou 'crescente' (1→N).
+    """
+    n = len(itens_fornecidos) if itens_fornecidos else num_itens
+    if itens_fornecidos:
+        notas_itens = (notas_itens or []) + [None] * len(itens_fornecidos)
+        linhas_itens = []
+        for i, t in enumerate(itens_fornecidos):
+            nota = f"  [nota do criador: {notas_itens[i]}]" if notas_itens[i] else ""
+            linhas_itens.append(f"{i + 1}. {t}{nota}")
+        bloco_itens = ("Os itens JÁ FORAM ESCOLHIDOS pelo criador do canal, na ordem em que aparecem no vídeo. "
+                       "Esta lista é INEGOCIÁVEL: cada item da saída deve ser EXATAMENTE o item de mesma posição "
+                       "abaixo — NUNCA substitua, funda, renomeie, reordene nem 'melhore' um item, mesmo que você "
+                       "não o conheça ou ache outro mais forte. Se não souber fatos sobre um item, NÃO invente: "
+                       "em \"cobre\" escreva \"POUCA INFORMAÇÃO\" e descreva só o que o nome e a nota do "
+                       "criador permitem afirmar, sem números, datas ou marcas inventados.\n" +
+                       "\n".join(linhas_itens))
+    else:
+        bloco_itens = (f"Escolha VOCÊ os {n} itens. Devem ser reais, específicos e distintos entre si "
+                       f"(nada repetido ou quase igual), e o último item mostrado deve ser o mais forte "
+                       f"ou surpreendente — a lista precisa ter um motivo pra ser vista até o fim.")
+    sentido = ("CONTAGEM REGRESSIVA: o primeiro item mostrado recebe o número {n} e o último recebe o número 1."
+               if ordem == 'regressiva' else
+               "ORDEM CRESCENTE: o primeiro item mostrado recebe o número 1 e o último recebe o número {n}.").format(n=n)
+    prompt = f"""Você é roteirista de vídeos em LISTA pro YouTube. NÃO escreva prosa ainda — apenas o
+esqueleto, em {idioma_conteudo}.
+
+NICHO: {contexto_nicho}
+TEMA DA LISTA: "{tema}"
+{_nota_publico()}
+{bloco_itens}
+{sentido}
+
+Regras:
+- São exatamente {n} itens.
+- O título de cada item é curto (1 a 6 palavras): o NOME do item como aparece num card na tela
+  (ex: o modelo da moto, o nome do prato), nunca uma frase.
+- Em "cobre", diga que fatos CONCRETOS esse item vai usar (ano, número, lugar, característica
+  marcante, curiosidade) e por que ele merece a posição que ocupa na lista.
+- "caso_ancoragem" aqui é o CRITÉRIO da lista: o que qualifica um item pra entrar (1 frase).
+- A introdução abre com um gancho curto ligado ao tema, deixa claro o critério e promete o que
+  vem — sem entregar o item final.
+- O desfecho fecha a lista (retoma o critério, comenta o que os itens têm em comum) e termina
+  provocando o espectador de um jeito específico deste tema (ex: perguntar qual item ele viveu
+  ou qual faltou), não um "e você, o que acha?" genérico.
+
+Retorne APENAS JSON:
+{{
+  "caso_ancoragem": "o critério da lista",
+  "introducao": "o que a introdução deve cobrir",
+  "capitulos": [
+    {{"n": 1, "titulo": "Nome do Item (copie exatamente o da posição n)", "cobre": "fatos concretos + por que está nessa posição"}}
+  ],
+  "desfecho": "o que o desfecho deve cobrir"
+}}
+(o array "capitulos" deve ter exatamente {n} itens)"""
+    estrutura = _extrair_json(gemini_generate_fn(prompt).text)
+    itens = estrutura.get('capitulos', [])
+    if len(itens) != n:
+        raise ValueError(f"estrutura de lista veio com {len(itens)} itens, esperado {n}")
+    if itens_fornecidos:
+        # O modelo ecoa o título de cada posição. Se algum NÃO bate com o que o usuário mandou,
+        # ele trocou/reordenou item: levanta erro e _com_retry_estagio refaz a estrutura inteira
+        # (corrigir só o título deixaria o "cobre" falando de OUTRO item).
+        for i, titulo in enumerate(itens_fornecidos):
+            eco = _norm_titulo(itens[i].get('titulo'))
+            alvo = _norm_titulo(titulo)
+            if eco != alvo and alvo not in eco and eco not in alvo:
+                raise ValueError(f"item {i + 1} veio como \"{itens[i].get('titulo')}\" "
+                                 f"em vez de \"{titulo}\" — modelo trocou o item")
+            itens[i]['titulo'] = titulo
+            if notas_itens and notas_itens[i]:
+                itens[i]['nota'] = notas_itens[i]
+    return estrutura
+
+
 def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, instrucao_extra,
-                           documento_estilo, palavras_alvo, gemini_generate_fn):
+                           documento_estilo, palavras_alvo, gemini_generate_fn,
+                           formato='webdoc', ordem_lista='regressiva'):
     """
     Escreve a prosa de introdução/capítulos/desfecho reaproveitando gerar_prosa (mesmo
     contrato: dict ordenado {{chave: descrição}} -> um bloco de texto por chave), e
@@ -515,8 +741,18 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
     concatenar tudo — não é um truque de texto aqui no roteiro.
     """
     estrutura_prosa = {'introducao': estrutura_capitulos['introducao']}
+    n_total = len(estrutura_capitulos['capitulos'])
     for i, cap in enumerate(estrutura_capitulos['capitulos']):
-        estrutura_prosa[f'capitulo_{i + 1}'] = cap['cobre']
+        if formato == 'lista':
+            numero = (n_total - i) if ordem_lista == 'regressiva' else (i + 1)
+            nota = f" Nota do criador sobre o item: {cap['nota']}." if cap.get('nota') else ""
+            estrutura_prosa[f'capitulo_{i + 1}'] = (
+                f'ITEM "{cap["titulo"]}" (número {numero} da lista). Escreva SOMENTE sobre ESTE item '
+                f'exato, com este nome — não troque por outro item nem por um parecido. Não invente '
+                f'fatos: se faltar informação, seja breve e geral em vez de inventar números ou '
+                f'marcas.{nota} Cobertura prevista: {cap["cobre"]}')
+        else:
+            estrutura_prosa[f'capitulo_{i + 1}'] = cap['cobre']
     estrutura_prosa['desfecho'] = estrutura_capitulos['desfecho']
 
     # O caso de ancoragem (ver gerar_estrutura_capitulos) precisa estar visível na
@@ -535,6 +771,17 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
         f"pode ser lida sem perder sentido num vídeo sobre outro tema qualquer, ela é "
         f"genérica demais e precisa ser reescrita com um fato concreto no lugar."
     )
+    if formato == 'lista':
+        n_itens = len(estrutura_capitulos['capitulos'])
+        reforco_densidade = (
+            f"FORMATO LISTA ({n_itens} itens). CRITÉRIO da lista: {caso_ancoragem}\n"
+            f"Cada item é um bloco que abre JÁ NOMEANDO o item e a posição dele (o número por "
+            f"extenso, falado) na primeira frase, porque a tela mostra um card com o número e "
+            f"o nome — a narração e o card precisam dizer a mesma coisa. Os itens têm "
+            f"tamanho parecido entre si (nenhum item é só uma frase). DENSIDADE: cada item traz "
+            f"pelo menos dois fatos específicos (ano, número, lugar, característica) — nada "
+            f"que serviria pra qualquer item. Não anuncie o item seguinte no fim de cada bloco."
+        )
     instrucao_extra_completa = f"{instrucao_extra}\n{reforco_densidade}" if instrucao_extra else reforco_densidade
 
     blocos = gerar_prosa(estrutura_prosa, contexto_nicho, idioma_conteudo, instrucao_extra_completa,
@@ -542,23 +789,38 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
 
     titulos_capitulos = {f'capitulo_{i + 1}': cap['titulo']
                           for i, cap in enumerate(estrutura_capitulos['capitulos'])}
+    n_cap = len(estrutura_capitulos['capitulos'])
     for b in blocos:
         titulo_cap = titulos_capitulos.get(b['bloco'])
         b['titulo_capitulo'] = titulo_cap
         b['inicio_capitulo'] = titulo_cap is not None
+        if formato == 'lista' and titulo_cap is not None:
+            # card com NÚMERO + NOME sobre a mídia do item (sem tela preta nem pausa)
+            idx = int(b['bloco'].split('_')[1]) - 1
+            b['formato_card'] = 'overlay'
+            b['numero_item'] = (n_cap - idx) if ordem_lista == 'regressiva' else (idx + 1)
 
     return blocos
 
 
 def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                                     documento_estilo, tipo_video, gemini_generate_fn,
-                                    num_capitulos=3, palavras_alvo=None):
+                                    num_capitulos=3, palavras_alvo=None,
+                                    formato='webdoc', itens_lista=None, ordem_lista='regressiva',
+                                    notas_lista=None):
     """
+    formato='lista' (ver gerar_estrutura_lista): mesma cadeia, mas os capítulos viram ITENS
+    numerados de uma lista, com card de número+nome sobre a mídia em vez de tela preta.
+
     Modo 'capitulos_webdoc' — formato investigativo em capítulos nomeados, cada um com
     card de transição e música própria. Mesmo contrato de saída de gerar_pacote_roteiro
     (roteiro_texto, roteiro_blocos, titulo, descricao), mais 'capitulos_meta' — lista
     pronta de {{'titulo', 'bloco'}} pra quem não quiser vasculhar roteiro_blocos.
     """
+    if palavras_alvo is None and _CFG['chars_min'] and _CFG['chars_max'] and tipo_video != 'short':
+        # alvo veio em CARACTERES (config) — converte pra palavras só pro prompt inicial;
+        # o tamanho de verdade é medido e corrigido em ajustar_tamanho_por_caracteres()
+        palavras_alvo = round(((_CFG['chars_min'] + _CFG['chars_max']) / 2) / _CFG['chars_por_palavra'])
     if palavras_alvo is None:
         # Webdoc investigativo real (tipo Elementar) fica na faixa de 12-20min — a ~140
         # palavras/minuto de narração falada, isso pede uns 1700-2400 palavras de roteiro.
@@ -567,15 +829,22 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
 
     try:
         print("  🧱 Estágio 1/4 — estrutura em capítulos...")
-        estrutura = _com_retry_estagio(
-            "Estágio 1/4 (estrutura)", gerar_estrutura_capitulos,
-            tema, contexto_nicho, idioma_conteudo, gemini_generate_fn, num_capitulos)
+        if formato == 'lista':
+            estrutura = _com_retry_estagio(
+                "Estágio 1/4 (estrutura de lista)", gerar_estrutura_lista,
+                tema, contexto_nicho, idioma_conteudo, gemini_generate_fn,
+                num_capitulos, itens_lista, ordem_lista, notas_lista)
+        else:
+            estrutura = _com_retry_estagio(
+                "Estágio 1/4 (estrutura)", gerar_estrutura_capitulos,
+                tema, contexto_nicho, idioma_conteudo, gemini_generate_fn, num_capitulos)
 
         print("  ✍️ Estágio 2/4 — escrita...")
         blocos = _com_retry_estagio(
             "Estágio 2/4 (escrita)", gerar_prosa_capitulos,
             estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
-            documento_estilo, palavras_alvo, gemini_generate_fn)
+            documento_estilo, palavras_alvo, gemini_generate_fn,
+            formato, ordem_lista)
 
         print("  🔍 Estágio 3/4 — crítica adversarial...")
         blocos = _com_retry_estagio(
@@ -586,13 +855,30 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
         # de nenhum reforço aqui (diferente de quando o título entrava embutido no
         # próprio texto falado, que já não é mais o caso).
 
+        if _CFG['chars_min'] and _CFG['chars_max']:
+            blocos = _com_retry_estagio(
+                "Ajuste de tamanho", ajustar_tamanho_por_caracteres,
+                blocos, idioma_conteudo, gemini_generate_fn)
+
+        # Passada final determinística: garante zero dígito/abreviação no texto que vai
+        # pro TTS, mesmo que o Gemini tenha deixado algum escapar nas etapas acima.
+        for b in blocos:
+            b['texto'] = _pos_processar_texto(b['texto'])
+            if _CFG['idioma_numeros'] and contem_digitos(b['texto']):
+                print(f"  ⚠️ Bloco '{b['bloco']}' ainda tem dígito após a normalização — revise.")
+
+        tema_meta = tema
+        if formato == 'lista':
+            n_it = len(estrutura['capitulos'])
+            tema_meta = (f"{tema} [FORMATO: vídeo de LISTA com {n_it} itens — o título deve conter "
+                         f"o número {n_it} e dizer o que a lista traz]")
         print("  🏷️ Estágio 4/4 — título e descrição...")
         titulo = _com_retry_estagio(
             "Estágio 4/4 (título)", gerar_titulo_final_simples,
-            tema, estrutura, idioma_conteudo, gemini_generate_fn)
+            tema_meta, estrutura, idioma_conteudo, gemini_generate_fn)
         descricao = _com_retry_estagio(
             "Estágio 4/4 (descrição)", gerar_descricao_final_simples,
-            tema, estrutura, idioma_conteudo, gemini_generate_fn)
+            tema_meta, estrutura, idioma_conteudo, gemini_generate_fn)
 
         roteiro_texto = " ".join(b['texto'] for b in blocos)
         capitulos_meta = [{'titulo': b['titulo_capitulo'], 'bloco': b['bloco']}
@@ -605,6 +891,7 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
             'descricao': descricao,
             'tese': None,
             'modo': 'capitulos_webdoc',
+            'formato': formato,
             'capitulos_meta': capitulos_meta,
         }
     except Exception as e:
@@ -656,7 +943,7 @@ def gerar_titulo_final_simples(tema, estrutura, idioma_conteudo, gemini_generate
     prompt = f"""Gere 10 variantes de título de vídeo para YouTube, em {idioma_conteudo}.
 Cada variante prioriza EXPLICITAMENTE um destes critérios (rotule qual):
 - gap_curiosidade: cria uma lacuna de informação sem entregar a resposta
-- especificidade: usa um NÚMERO ou detalhe concreto do vídeo (valor em R$, %, quantidade)
+- especificidade: usa um NÚMERO ou detalhe concreto do vídeo (valor monetário na moeda do público, %, quantidade)
 - emocao: nomeia o sentimento/estado que o vídeo aborda (indignação, choque, injustiça)
 
 TEMA: {tema}
@@ -763,7 +1050,7 @@ IMPORTANTE — texto vai pra um TTS que lê tudo de forma LITERAL: se o texto or
 menciona um país/órgão/instituição por extenso (ex: "Estados Unidos"), o texto_novo
 tem que MANTER por extenso. Nunca troque isso por sigla, abreviação, ou por uma letra/
 código curto pra "variar" o texto ou evitar repetição — se precisar variar, use uma
-expressão equivalente por extenso ("o país", "a potência americana"), nunca uma sigla.
+expressão equivalente por extenso ("o país", "a potência americana"), nunca uma sigla.{_regra_numeros()}
 
 Retorne APENAS JSON: {{"reescritas": [{{"indice": 0, "texto_novo": "..."}}]}}"""
 
@@ -780,7 +1067,7 @@ Retorne APENAS JSON: {{"reescritas": [{{"indice": 0, "texto_novo": "..."}}]}}"""
         i = r.get('indice')
         if isinstance(i, int) and 0 <= i < len(blocos) and r.get('texto_novo'):
             texto_novo = padrao_prefixo.sub('', r['texto_novo'].strip())
-            blocos[i]['texto'] = sanitizar_direcoes_de_producao(texto_novo.strip())
+            blocos[i]['texto'] = _pos_processar_texto(sanitizar_direcoes_de_producao(texto_novo.strip()))
 
     return blocos
 
@@ -846,7 +1133,9 @@ Retorne APENAS JSON: {{"abertura_seo": "...", "corpo": "..."}}"""
 
 def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                           documento_estilo, tipo_video, gemini_generate_fn,
-                          modo_roteiro='cadeia_completa', num_capitulos=3, palavras_alvo_webdoc=None):
+                          modo_roteiro='cadeia_completa', num_capitulos=3, palavras_alvo_webdoc=None,
+                          formato='webdoc', itens_lista=None, ordem_lista='regressiva',
+                          notas_lista=None):
     """
     Roda a cadeia completa (modo_roteiro='cadeia_completa', padrão), o modo simples
     sem tese/objeção (modo_roteiro='simples'), ou o modo webdoc em capítulos nomeados
@@ -865,7 +1154,9 @@ def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
         return gerar_pacote_roteiro_capitulos(
             tema, contexto_nicho, idioma_conteudo, instrucao_extra, documento_estilo,
             tipo_video, gemini_generate_fn, num_capitulos=num_capitulos,
-            palavras_alvo=palavras_alvo_webdoc
+            palavras_alvo=palavras_alvo_webdoc,
+            formato=formato, itens_lista=itens_lista, ordem_lista=ordem_lista,
+            notas_lista=notas_lista
         )
 
     try:

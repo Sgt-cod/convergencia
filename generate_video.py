@@ -33,6 +33,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 from roteiro_engine import gerar_pacote_roteiro
+import roteiro_engine
+from alinhamento import alinhar_roteiro_com_whisper
 from producao_visual import (
     mapear_tempos_para_blocos,
     escolher_termos_por_bloco,
@@ -42,14 +44,16 @@ from producao_visual import (
     construir_timeline_sfx,
     decidir_prints_de_noticia,
     mapear_destaques_manuais_para_blocos,
+    configurar_pais,
 )
 from transicoes import TRANSICOES_DISPONIVEIS, transicao_crossfade
 from mockups_visuais import gerar_print_noticia
 from rede_utils import com_watchdog
 from telegram_review import (
-    ATIVA_TELEGRAM, revisar_midia_pipeline, escolher_tema_telegram,
+    ATIVA_TELEGRAM, revisar_midia_pipeline, escolher_tema_telegram, escolher_formato_telegram,
     escolher_destaques_telegram, revisar_thumbnail_telegram, WorkflowCanceladoPeloUsuario,
-    perguntar_audio_customizado_telegram,
+    perguntar_audio_customizado_telegram, configurar_tradutor,
+    escolher_publicacao_telegram, enviar_texto as telegram_enviar_texto,
 )
 
 # ============================================================
@@ -62,7 +66,9 @@ except ImportError:
     print("⚠️ telegram_curator_noticias.py não encontrado")
     CURACAO_DISPONIVEL = False
 
-CONFIG_FILE = 'config.json'
+# CONFIG_FILE permite rodar o MESMO código pra mais de um canal (ex: config_no.json pro
+# canal em norueguês) sem duplicar o repositório — cada workflow aponta pro seu config.
+CONFIG_FILE = os.environ.get('CONFIG_FILE', 'config.json')
 VIDEOS_DIR = 'videos'
 ASSETS_DIR = 'assets'
 VIDEO_TYPE = os.environ.get('VIDEO_TYPE', 'short')  # 'short' (vertical) ou 'long' (horizontal)
@@ -168,6 +174,17 @@ if 'SEGUNDOS_LEAD_IN_SEGMENTO' not in os.environ and 'padding_inicio_segmento_we
 if 'SEGUNDOS_TAIL_SEGMENTO' not in os.environ and 'padding_fim_segmento_webdoc' in config:
     SEGUNDOS_TAIL_SEGMENTO = float(config['padding_fim_segmento_webdoc'])
 
+# Duração de cada clipe de mídia: config.json ('duracao_minima_clipe'/'duracao_maxima_clipe')
+# vale se a env var correspondente NÃO foi setada (env continua tendo prioridade).
+if 'DURACAO_MAXIMA_CLIPE' not in os.environ and 'duracao_maxima_clipe' in config:
+    DURACAO_MAXIMA_CLIPE = float(config['duracao_maxima_clipe'])
+if 'DURACAO_MINIMA_CLIPE' not in os.environ and 'duracao_minima_clipe' in config:
+    DURACAO_MINIMA_CLIPE = float(config['duracao_minima_clipe'])
+# Modo estrito: PLANEJA os cortes do bloco antes de baixar (n clipes de duração igual, todos
+# dentro de [mínimo, máximo]) em vez do comportamento antigo (cortar no máximo e absorver o
+# resto no clipe anterior, que podia estourar o máximo).
+SLOTS_ESTRITOS = bool(config.get('duracao_clipe_estrita', False))
+
 DURACAO_MAXIMA_PRINT_NOTICIA = float(config.get('duracao_maxima_print_noticia', 9))
 # Idioma do conteúdo gerado (roteiro, título, thumbnail) — mude só isso no config.json
 # pra clonar o canal em outro idioma, sem tocar no código.
@@ -204,6 +221,141 @@ MAX_DESTAQUES_POR_BLOCO = int(config.get('max_destaques_por_bloco', 2))
 # diretamente, não precisa estar instalada no sistema).
 FONTE_THUMBNAIL_ARQUIVO = config.get('fonte_thumbnail_arquivo', '')
 
+# ── Configuração dos módulos por canal (idioma de números, país, tamanho do roteiro) ───
+roteiro_engine.configurar(
+    idioma_numeros=config.get('numeros_por_extenso_idioma'),
+    regra_numeros=config.get('regra_numeros_roteiro'),
+    nota_publico=config.get('nota_publico_roteiro'),
+    chars_min=config.get('caracteres_alvo_min'),
+    chars_max=config.get('caracteres_alvo_max'),
+    chars_por_palavra=config.get('caracteres_por_palavra'),
+)
+configurar_pais(**{k: v for k, v in config.get('contexto_pais', {}).items()})
+
+IDIOMA_REVISAO_PTBR = bool(config.get('telegram_traducao_ptbr', {}).get('ativo', False))
+# Canal em português: não há o que traduzir, mas a SUGESTÃO de mídia (+ botão do Pexels) continua
+# útil. 'telegram_sugestao_midia': {"ativo": true} liga o tradutor nesse modo "só sugestão".
+IDIOMA_CONTEUDO_EH_PT = 'portugu' in IDIOMA_CONTEUDO.lower()
+SUGESTAO_MIDIA_TELEGRAM = bool(config.get('telegram_sugestao_midia', {}).get('ativo', False))
+
+
+_MARCADORES_PT = {'não', 'que', 'uma', 'para', 'com', 'foi', 'são', 'mas', 'também', 'seu', 'sua',
+                  'dos', 'das', 'nos', 'nas', 'era', 'tinha', 'pelo', 'pela', 'como', 'os', 'as',
+                  'um', 'ao', 'quando', 'ele', 'ela', 'mais', 'muito', 'depois', 'ainda'}
+_MARCADORES_NO = {'og', 'ikke', 'som', 'det', 'til', 'av', 'på', 'ble', 'var', 'har', 'men', 'med',
+                  'seg', 'han', 'hun', 'den', 'denne', 'fra', 'ved', 'også', 'mot', 'hadde',
+                  'etter', 'eller', 'når', 'bare', 'mange', 'hva', 'jeg', 'vi', 'dere', 'dette'}
+
+
+def _parece_portugues(original, traducao):
+    """Barreira contra o defeito 'a tradução veio igual ao original': descarta tradução vazia,
+    idêntica ao texto de origem ou com mais palavras-marcador de norueguês que de português."""
+    if not traducao:
+        return False
+    norm = lambda t: re.sub(r'\W+', ' ', t.lower()).strip()
+    if norm(traducao) == norm(original):
+        return False
+    palavras = norm(traducao).split()
+    return sum(w in _MARCADORES_PT for w in palavras) >= sum(w in _MARCADORES_NO for w in palavras)
+
+
+def _gemini_json(prompt):
+    return json.loads(_extrair_json_resposta(_gemini_generate(prompt).text))
+
+
+def _traduzir_lote(textos, estrito=False):
+    """Só TRADUZ (sem sugestão de mídia na mesma chamada — pedir as duas coisas juntas
+    fazia o modelo devolver o trecho sem traduzir)."""
+    itens = json.dumps(list(textos), ensure_ascii=False)
+    reforco = ("ATENÇÃO: a resposta anterior voltou no idioma original. Cada item DEVE sair em "
+               "português do Brasil — nenhuma palavra do idioma de origem, exceto nomes próprios.\n\n"
+               if estrito else "")
+    prompt = f"""{reforco}Você é tradutor. Traduza para PORTUGUÊS DO BRASIL cada texto da lista JSON abaixo
+(o idioma de origem é {IDIOMA_CONTEUDO}). Tradução fiel e natural, sem resumir nem acrescentar.
+Mantenha só nomes próprios no original.
+
+Exemplo: "Han bodde i Oslo i førti år." -> "Ele morou em Oslo por quarenta anos."
+
+LISTA ({len(textos)} itens):
+{itens}
+
+Responda APENAS com JSON, uma tradução por item, na MESMA ordem e quantidade:
+{{"traducoes": ["tradução do item 1", "tradução do item 2"]}}"""
+    brutas = _gemini_json(prompt).get('traducoes', [])
+    saida = []
+    for t in brutas:
+        saida.append((t.get('pt') if isinstance(t, dict) else t) or '')
+    return [x.strip() for x in saida]
+
+
+def _sugerir_midia(textos_pt):
+    """Sugestão do que o clipe deve MOSTRAR (PT-BR) + termo de busca em inglês pro Pexels."""
+    itens = json.dumps(list(textos_pt), ensure_ascii=False)
+    prompt = f"""Pra cada trecho de narração (em português) abaixo, diga que imagem/vídeo de banco de
+imagens combina com ele. Evite pessoas famosas e marcas.
+
+TRECHOS ({len(textos_pt)} itens):
+{itens}
+
+Responda APENAS com JSON, um objeto por trecho, MESMA ORDEM e quantidade:
+{{"itens": [{{"sugestao": "frase curta em PT-BR, ex: vista aérea de um fiorde",
+"busca_en": "termo de busca em INGLÊS, 2 a 5 palavras concretas e visuais, ex: aerial view norwegian fjord"}}]}}"""
+    return _gemini_json(prompt).get('itens', [])
+
+
+def _traduzir_para_ptbr(textos, com_sugestao=False):
+    """
+    Tradutor injetado no telegram_review: 1 chamada por segmento (não 1 por clipe) pra
+    traduzir; com com_sugestao=True faz uma 2ª chamada, separada, com a sugestão de mídia.
+    Traduções que voltam iguais ao original (ou ainda em norueguês) são refeitas item a
+    item; se ainda falhar, o item fica SEM tradução (None) em vez de repetir o norueguês.
+    """
+    verificar = not IDIOMA_CONTEUDO_EH_PT
+    if IDIOMA_CONTEUDO_EH_PT:
+        pts = [''] * len(textos)   # canal em português: nada a traduzir, só sugestão de mídia
+    else:
+        try:
+            pts = _traduzir_lote(textos)
+        except Exception as e:
+            print(f"  ⚠️ Tradução em lote falhou ({e}) — tentando item a item")
+            pts = []
+        pts = (pts + [''] * len(textos))[:len(textos)]
+
+    for i, (orig, trad) in enumerate(zip(textos, pts)):
+        if verificar and not _parece_portugues(orig, trad):
+            try:
+                novo = _traduzir_lote([orig], estrito=True)
+                trad = novo[0] if novo else ''
+            except Exception:
+                trad = ''
+            pts[i] = trad if _parece_portugues(orig, trad) else ''
+            if not pts[i]:
+                print(f"  ⚠️ Tradução do item {i + 1} não saiu em português — item sem tradução")
+
+    sugestoes = [{} for _ in textos]
+    if com_sugestao:
+        try:
+            base = [pt or orig for pt, orig in zip(pts, textos)]
+            sug = _sugerir_midia(base)
+            if len(sug) == len(textos):
+                sugestoes = [x if isinstance(x, dict) else {} for x in sug]
+        except Exception as e:
+            print(f"  ⚠️ Sugestão de mídia indisponível ({e})")
+
+    return [{'pt': pts[i] or None,
+             'sugestao': (sugestoes[i].get('sugestao') or '').strip() or None,
+             'busca_en': (sugestoes[i].get('busca_en') or '').strip() or None}
+            for i in range(len(textos))]
+
+
+def _extrair_json_resposta(texto):
+    texto = texto.strip().replace('```json', '').replace('```', '').strip()
+    return texto[texto.find('{'):texto.rfind('}') + 1]
+
+
+if IDIOMA_REVISAO_PTBR or SUGESTAO_MIDIA_TELEGRAM:
+    configurar_tradutor(_traduzir_para_ptbr)
+
 # Volume da música de fundo em relação à narração (0.06 = 6% do volume da narração,
 # que fica em 1.0). Suba pra deixar a música mais alta — ex: 0.12 já é bem perceptível,
 # cuidado pra não competir com a voz. Configurável só no config.json (não tem env var
@@ -215,7 +367,7 @@ VOLUME_MUSICA_FUNDO = float(config.get('volume_musica_fundo', 0.06))
 # TEMA DO DIA — rotação sem repetição
 # ============================================================
 
-TEMAS_LOG_FILE = 'temas_usados.json'
+TEMAS_LOG_FILE = config.get('arquivo_temas_usados', 'temas_usados.json')
 
 
 def _carregar_temas_usados():
@@ -516,13 +668,18 @@ async def criar_audio_edge_async(texto, output_file):
 
 
 def criar_audio(texto, output_file):
-    print("🎙️ Criando narração (Fish Audio)...")
-    try:
-        criar_audio_fishaudio(texto, output_file)
-        print("✅ Fish Audio")
-        return output_file
-    except Exception as e:
-        print(f"⚠️ Fish Audio falhou: {e} — usando Edge TTS como fallback")
+    # 'usar_fishaudio': false no config.json pula direto pro Edge TTS — pra canais cuja voz
+    # clonada não fala o idioma do conteúdo (o áudio real vem do Telegram nesse caso).
+    if config.get('usar_fishaudio', True):
+        print("🎙️ Criando narração (Fish Audio)...")
+        try:
+            criar_audio_fishaudio(texto, output_file)
+            print("✅ Fish Audio")
+            return output_file
+        except Exception as e:
+            print(f"⚠️ Fish Audio falhou: {e} — usando Edge TTS como fallback")
+    else:
+        print("🎙️ Criando narração (Edge TTS — Fish Audio desativado no config)...")
 
     try:
         loop = asyncio.new_event_loop()
@@ -553,7 +710,8 @@ _whisper_model = None
 # de B-roll por bloco (que usa esses timestamps pra fatiar o tempo) impreciso. "small"
 # é o próximo degrau: ainda roda bem em CPU, mas com alinhamento de palavra bem mais
 # fiel. Configurável via env var pra quem quiser trocar de novo sem editar código.
-WHISPER_MODEL_SIZE = os.environ.get('WHISPER_MODEL_SIZE', 'small')
+# Norueguês: 'small' erra bem mais que em português — config_no.json usa 'medium'.
+WHISPER_MODEL_SIZE = os.environ.get('WHISPER_MODEL_SIZE', config.get('whisper_model_size', 'small'))
 
 
 def _carregar_whisper():
@@ -565,8 +723,14 @@ def _carregar_whisper():
     return _whisper_model
 
 
-def transcrever_palavras_com_timestamps(audio_path):
+def transcrever_palavras_com_timestamps(audio_path, texto_referencia=None):
     """
+    texto_referencia (opcional): o roteiro que o áudio deveria estar falando. Com
+    config.json 'alinhar_whisper_ao_roteiro': true, as palavras do Whisper são ALINHADAS
+    por conteúdo ao roteiro (ver alinhamento.py) e a lista devolvida tem exatamente
+    len(texto_referencia.split()) itens — em vez do pareamento posicional antigo, que
+    desliza a cada divergência de contagem (números, palavras compostas em norueguês).
+
     Transcreve com timestamp POR PALAVRA — mas usamos só o TEMPO de cada palavra,
     nunca o texto que o Whisper reconheceu (que pode ter erros de reconhecimento/ortografia).
     O texto exibido na legenda vem sempre do roteiro original do Gemini.
@@ -584,7 +748,17 @@ def transcrever_palavras_com_timestamps(audio_path):
     for seg in segments:
         if seg.words:
             for w in seg.words:
-                palavras_tempo.append({'inicio': w.start, 'fim': w.end})
+                palavras_tempo.append({'inicio': w.start, 'fim': w.end, 'texto': w.word})
+
+    if texto_referencia and config.get('alinhar_whisper_ao_roteiro', False) and palavras_tempo:
+        alinhadas, taxa = alinhar_roteiro_com_whisper(texto_referencia.split(), palavras_tempo)
+        if alinhadas:
+            print(f"  🧭 Alinhamento por conteúdo: {len(texto_referencia.split())} palavras do roteiro "
+                  f"× {len(palavras_tempo)} do Whisper — {taxa:.0%} casaram exatamente")
+            if taxa < 0.5:
+                print("  ⚠️ Menos de 50% das palavras casaram — confira se o áudio enviado é mesmo "
+                      "deste texto (ou se o idioma do Whisper no config está certo).")
+            return alinhadas
     return palavras_tempo
 
 
@@ -968,8 +1142,40 @@ def _duracao_real_arquivo(caminho):
         return None
 
 
-def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
+def _planejar_slots(duracao, minimo, maximo):
     """
+    Divide 'duracao' (s) em N cortes IGUAIS, cada um em [minimo, maximo] sempre que
+    matematicamente possível: precisa existir N inteiro com minimo*N <= duracao <= maximo*N.
+    Isso só falha em janelas estreitas (com 7.5–10: duração entre 10 e 15 s, ou 20 e 22.5 s);
+    nesse caso escolhe o N que erra MENOS (a menor distância até a faixa). Blocos de
+    narração do webdoc têm dezenas de segundos, então na prática isso não acontece.
+    Duração <= máximo vira um corte só (mesmo abaixo do mínimo — não há como cortar menos).
+    """
+    if duracao <= 0:
+        return []
+    if duracao <= maximo:
+        return [duracao]
+    n_min = math.ceil(duracao / maximo - 1e-9)
+    n_max = max(1, math.floor(duracao / minimo + 1e-9))
+    if n_min <= n_max:
+        ideal = duracao / ((minimo + maximo) / 2)
+        n = min(max(round(ideal), n_min), n_max)
+    else:
+        def desvio(n):
+            d = duracao / n
+            return max(0.0, d - maximo, minimo - d)
+        n = min((n_min, max(1, n_min - 1)), key=desvio)
+    return [duracao / n] * n
+
+
+def baixar_clipes_por_bloco(blocos_com_tempo, orientacao, padding_inicio=0.0, padding_fim=0.0):
+    """
+    padding_inicio/padding_fim: segundos de mídia muda que o chamador vai ESTICAR sobre o 1º
+    e o último clipe depois (lead-in/tail do segmento). No modo estrito esses segundos entram
+    no PLANEJAMENTO do corte (pra o clipe final já durar de 7.5 a 10 s contando o padding) e
+    saem da duração gravada em 'duracao' (que é em tempo de narração).
+
+    ── Descrição original ──
     Fase 2 — B-roll casado por BLOCO do roteiro, não pelo vídeo inteiro: cada bloco
     (gancho, evidência, objeção...) já chegou aqui com seu próprio 'termo' (escolhido por
     producao_visual.escolher_termos_por_bloco) e sua própria janela de tempo dentro da
@@ -995,6 +1201,33 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
         offset_bloco = bloco['inicio']
         termo_especifico_ja_tentado = False  # só tenta 1x por bloco, não flooda o mesmo bloco de Wikimedia
 
+        # Modo estrito (config 'duracao_clipe_estrita'): planeja TODOS os cortes do bloco
+        # antes de baixar nada. 'slots' = duração de cada corte em tempo de NARRAÇÃO (já sem
+        # o padding); 'slots_exibidos' = duração final do clipe contando o padding que o
+        # chamador estica sobre o 1º/último clipe (é essa que fica entre mínimo e máximo).
+        slots, slots_exibidos, idx_slot = None, None, 0
+        if SLOTS_ESTRITOS:
+            pad_i = padding_inicio if i == 0 else 0.0
+            pad_f = padding_fim if i == len(blocos_com_tempo) - 1 else 0.0
+            slots_exibidos = _planejar_slots(duracao_alvo + pad_i + pad_f,
+                                             DURACAO_MINIMA_CLIPE, DURACAO_MAXIMA_CLIPE)
+            slots = list(slots_exibidos)
+            if slots:
+                slots[0] = max(0.5, slots[0] - pad_i)
+                slots[-1] = max(0.5, slots[-1] - pad_f)
+            print(f"    ✂️ Plano de cortes: {len(slots)} clipe(s) de "
+                  f"~{(sum(slots_exibidos) / max(len(slots_exibidos), 1)):.1f}s "
+                  f"(faixa {DURACAO_MINIMA_CLIPE}–{DURACAO_MAXIMA_CLIPE}s)")
+
+        def _extra_slot():
+            """Campos extras do clipe no modo estrito (duração exibida pro Telegram)."""
+            if slots_exibidos and idx_slot < len(slots_exibidos):
+                return {'duracao_exibida': slots_exibidos[idx_slot]}
+            return {}
+
+        def _falta_cobrir():
+            return (idx_slot < len(slots)) if SLOTS_ESTRITOS else (tempo_coberto < duracao_alvo)
+
         print(f"  🎯 Bloco '{bloco['bloco']}' ({duracao_alvo:.1f}s) — termo: '{termo}'"
               + (f" (específico: '{bloco['termo_especifico']}')" if bloco.get('termo_especifico') else ""))
 
@@ -1012,6 +1245,8 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                 # RESTO do bloco cai pro fluxo normal de B-roll logo abaixo (mesmo
                 # while loop, só que começando com tempo_coberto > 0 em vez de 0).
                 duracao_print = min(duracao_alvo, DURACAO_MAXIMA_PRINT_NOTICIA)
+                if SLOTS_ESTRITOS and slots:
+                    duracao_print = slots[0]   # o print ocupa o 1º corte planejado
                 caminho_print = gerar_print_noticia(
                     manchete=bloco['manchete_noticia'],
                     corpo=bloco.get('corpo_noticia'),
@@ -1025,9 +1260,11 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                     'inicio': offset_bloco,
                     'duracao': duracao_print,
                     'transicao_bloco': not bloco.get('inicio_capitulo'),
+                    **_extra_slot(),
                 })
                 print(f"    📰 Print de notícia gerado ({duracao_print:.1f}s): \"{bloco['manchete_noticia']}\"")
                 tempo_coberto = duracao_print  # o resto do bloco (se sobrar) vira B-roll normal abaixo
+                idx_slot += 1
             except Exception as e:
                 print(f"    ⚠️ Falha ao gerar print de notícia ({e}) — caindo pro B-roll normal")
                 tempo_coberto = 0.0
@@ -1035,7 +1272,7 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
             tempo_coberto = 0.0
 
         pagina = 1
-        while tempo_coberto < duracao_alvo and pagina <= MAX_PAGINAS_BLOCO:
+        while _falta_cobrir() and pagina <= MAX_PAGINAS_BLOCO:
             if LIMITE_CLIPES_TESTE > 0 and len(todos_os_clipes) >= LIMITE_CLIPES_TESTE:
                 print(f"   ✂️ MODO TESTE: limitado a {LIMITE_CLIPES_TESTE} clipe(s) no total")
                 return todos_os_clipes
@@ -1049,7 +1286,7 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
             #    sorteio configurável de sempre ('pesos_fontes_midia') — sem isso
             #    configurado, sempre Pexels (100% compatível com o comportamento antigo).
             caminho_alt, fonte_alt = None, None
-            if duracao_alvo - tempo_coberto >= 3:  # não vale a pena buscar fonte alternativa pra um resto minúsculo
+            if SLOTS_ESTRITOS or duracao_alvo - tempo_coberto >= 3:  # não vale a pena buscar fonte alternativa pra um resto minúsculo
                 termo_especifico = bloco.get('termo_especifico')
                 if termo_especifico and not termo_especifico_ja_tentado:
                     termo_especifico_ja_tentado = True
@@ -1067,14 +1304,18 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                 min_s = config.get('duracao_slot_midia_alternativa_min', 10)
                 max_s = config.get('duracao_slot_midia_alternativa_max', 14)
                 duracao_slot = min(random.uniform(min_s, max_s), duracao_alvo - tempo_coberto)
+                if SLOTS_ESTRITOS:
+                    duracao_slot = slots[idx_slot]
                 todos_os_clipes.append({
                     'path': caminho_alt,
                     'inicio': offset_bloco + tempo_coberto,
                     'duracao': duracao_slot,
                     'transicao_bloco': (tempo_coberto == 0.0) and not bloco.get('inicio_capitulo'),
                     'fonte': fonte_alt,
+                    **_extra_slot(),
                 })
                 tempo_coberto += duracao_slot
+                idx_slot += 1
                 continue  # próxima volta do while decide de novo (Pexels ou outra fonte)
 
             videos_encontrados = pesquisar_videos_pexels(termo, orientacao, pagina=pagina)
@@ -1082,9 +1323,13 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                 print(f"    ⚠️ Página {pagina} sem resultados para '{termo}'")
                 break
             random.shuffle(videos_encontrados)
+            if SLOTS_ESTRITOS and idx_slot < len(slots):
+                # vídeo mais curto que o corte seria repetido (loop) — deixa pro fim da fila
+                _alvo_slot = slots[idx_slot]
+                videos_encontrados.sort(key=lambda v: 0 if v.get('duration', 0) >= _alvo_slot else 1)
 
             for video in videos_encontrados:
-                if tempo_coberto >= duracao_alvo:
+                if not _falta_cobrir():
                     break
                 if LIMITE_CLIPES_TESTE > 0 and len(todos_os_clipes) >= LIMITE_CLIPES_TESTE:
                     break
@@ -1127,6 +1372,10 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                 resto_apos = (duracao_alvo - tempo_coberto) - duracao_uso
                 if 0 < resto_apos < DURACAO_MINIMA_CLIPE:
                     duracao_uso = min(duracao_disponivel, duracao_uso + resto_apos)
+                if SLOTS_ESTRITOS:
+                    # duração é a do CORTE PLANEJADO, não a do arquivo: se o vídeo for mais
+                    # curto, _preparar_clip_pexels repete ele em loop até cobrir o corte.
+                    duracao_uso = slots[idx_slot]
 
                 todos_os_clipes.append({
                     'path': destino,
@@ -1137,13 +1386,15 @@ def baixar_clipes_por_bloco(blocos_com_tempo, orientacao):
                     # pelo card preto + vinheta silenciosos, um crossfade "vazaria"
                     # B-roll pra dentro do silêncio antes do card acabar.
                     'transicao_bloco': (tempo_coberto == 0.0) and not bloco.get('inicio_capitulo'),
+                    **_extra_slot(),
                 })
                 tempo_coberto += duracao_uso
+                idx_slot += 1
                 _salvar_pexels_usado(video_id)
 
             pagina += 1
 
-        if tempo_coberto < duracao_alvo:
+        if _falta_cobrir():
             print(f"    ⚠️ Cobertura parcial do bloco: {tempo_coberto:.1f}s/{duracao_alvo:.1f}s")
 
     print(f"  ✅ {len(todos_os_clipes)} clipe(s) baixado(s) no total, casados por bloco do roteiro")
@@ -1649,7 +1900,8 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
     clips_destaque = clips_destaque or []
 
     import glob
-    intros = glob.glob(f'{ASSETS_DIR}/intro/*.mp4') + glob.glob(f'{ASSETS_DIR}/intro/*.mov')
+    _pasta_intro = config.get('pasta_intro', f'{ASSETS_DIR}/intro')
+    intros = glob.glob(f'{_pasta_intro}/*.mp4') + glob.glob(f'{_pasta_intro}/*.mov')
     intro_duracao = 0.0
     intro_clip = None
 
@@ -1767,7 +2019,10 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     audio_customizado = None
     if ATIVA_TELEGRAM and config.get('audio_customizado_telegram', {}).get('ativo', True):
         try:
-            audio_customizado = perguntar_audio_customizado_telegram(nome_segmento)
+            audio_customizado = perguntar_audio_customizado_telegram(
+                nome_segmento, texto_segmento=texto_segmento)
+        except WorkflowCanceladoPeloUsuario:
+            raise  # cancelamento / áudio obrigatório não enviado: nunca vira "gerar automático"
         except Exception as e:
             print(f"  ⚠️ Falha ao perguntar áudio customizado via Telegram ({e}) — "
                   f"gerando narração automática pra este segmento")
@@ -1780,7 +2035,7 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
         criar_audio(texto_segmento, audio_path_seg)
 
     try:
-        palavras_tempo = transcrever_palavras_com_timestamps(audio_path_seg)
+        palavras_tempo = transcrever_palavras_com_timestamps(audio_path_seg, texto_referencia=texto_segmento)
     except Exception as e:
         print(f"    ⚠️ Falha na transcrição do segmento ({e}) — seguindo sem timestamps de palavra")
         palavras_tempo = []
@@ -1821,7 +2076,9 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
             blocos_com_tempo_local, _gemini_generate,
             usar_prints_noticia=config.get('usar_prints_noticia', False)
         )
-        lista_clipes = baixar_clipes_por_bloco(blocos_com_tempo_local, orientacao)
+        lista_clipes = baixar_clipes_por_bloco(
+            blocos_com_tempo_local, orientacao,
+            padding_inicio=SEGUNDOS_LEAD_IN_SEGMENTO, padding_fim=SEGUNDOS_TAIL_SEGMENTO)
 
         destaques_manuais = destaques_manuais_pre
 
@@ -1896,7 +2153,16 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     clips_legenda = [c.set_start(c.start + padding_inicio) for c in clips_legenda]
     clips_destaque = [c.set_start(c.start + padding_inicio) for c in clips_destaque]
 
-    video_base = CompositeVideoClip(clips_video + clips_legenda + clips_destaque,
+    # Formato LISTA: card de número + nome do item SOBRE a mídia (sem tela preta, sem pausa).
+    clips_card_item = []
+    b0 = grupo_blocos[0]
+    if b0.get('formato_card') == 'overlay' and b0.get('titulo_capitulo'):
+        dur_card = float(config.get('duracao_card_item', 4.5))
+        clips_card_item = [gerar_card_item_overlay(b0.get('numero_item'), b0['titulo_capitulo'],
+                                                   largura, altura, dur_card)
+                           .set_start(min(0.8, padding_inicio))]
+
+    video_base = CompositeVideoClip(clips_video + clips_legenda + clips_destaque + clips_card_item,
                                      size=(largura, altura)).set_duration(duracao_segmento)
 
     audio_narr = AudioFileClip(audio_path_seg).set_start(padding_inicio)
@@ -1965,8 +2231,10 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
             clip_bruto = clip_bruto.without_audio()
         return clip_bruto, caminho
 
-    vinheta_clip, intro_path = _carregar_clip_de_pasta(f'{ASSETS_DIR}/intro', largura, altura,
-                                                         manter_audio=False)
+    # 'intro_com_audio': true mantém o som original do arquivo da intro (padrão: muda, como
+    # a vinheta do Convergência, que toca só com a música/narração ao redor).
+    vinheta_clip, intro_path = _carregar_clip_de_pasta(config.get('pasta_intro', f'{ASSETS_DIR}/intro'), largura, altura,
+                                                         manter_audio=bool(config.get('intro_com_audio', False)))
     if vinheta_clip:
         print(f"  🎬 Vinheta: {os.path.basename(intro_path)}")
     else:
@@ -1976,7 +2244,7 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
     # embutido, colocado em assets/cta/ (mesmo esquema da vinheta em assets/intro/).
     # Ao contrário dos capítulos, não entra card de título preto antes dele — é
     # concatenado direto depois do desfecho, como uma peça de encerramento normal.
-    cta_clip, cta_path = _carregar_clip_de_pasta(f'{ASSETS_DIR}/cta', largura, altura,
+    cta_clip, cta_path = _carregar_clip_de_pasta(config.get('pasta_cta', f'{ASSETS_DIR}/cta'), largura, altura,
                                                    manter_audio=True)
     if cta_clip:
         print(f"  📣 CTA final: {os.path.basename(cta_path)}")
@@ -1995,6 +2263,8 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
         if i < len(segmentos) - 1:
             if i == 0 and vinheta_clip:
                 clips_finais.append(vinheta_clip)
+            if segmentos[i + 1][0].get('formato_card') == 'overlay':
+                continue  # lista: o card entra como overlay dentro do próprio item
             titulo_proximo = segmentos[i + 1][0].get('titulo_capitulo', '')
             card = gerar_card_capitulo(titulo_proximo, largura, altura, duracao=duracao_card)
             clips_finais.append(card)
@@ -2090,6 +2360,57 @@ def gerar_card_capitulo(titulo, largura, altura, duracao=None):
     fade = min(0.4, duracao / 4)
     clip = ImageClip(caminho_temp).set_duration(duracao).fadein(fade).fadeout(fade)
     return clip
+
+
+def gerar_card_item_overlay(numero, titulo, largura, altura, duracao=4.5):
+    """
+    Card do item de uma LISTA: faixa translúcida com o número grande e o nome do item,
+    desenhada sobre a mídia (fundo transparente + fade suave). Mesma fonte do card de
+    capítulo/destaque (identidade visual igual).
+    """
+    from moviepy.editor import ImageClip
+
+    img = Image.new('RGBA', (largura, altura), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    texto_num = f"#{numero}" if numero is not None else ""
+    nome = titulo.upper()
+    largura_max = int(largura * 0.74)
+
+    tam_nome = int(largura / 24)
+    for _ in range(6):
+        fonte_nome = _carregar_fonte_pil_destaque(tam_nome)
+        bb = draw.textbbox((0, 0), nome, font=fonte_nome)
+        if (bb[2] - bb[0]) <= largura_max or tam_nome <= 28:
+            break
+        tam_nome = max(28, int(tam_nome * largura_max / (bb[2] - bb[0])))
+    fonte_num = _carregar_fonte_pil_destaque(int(largura / 11))
+
+    bb_n = draw.textbbox((0, 0), texto_num, font=fonte_num) if texto_num else (0, 0, 0, 0)
+    bb_t = draw.textbbox((0, 0), nome, font=fonte_nome)
+    w_n, h_n = bb_n[2] - bb_n[0], bb_n[3] - bb_n[1]
+    w_t, h_t = bb_t[2] - bb_t[0], bb_t[3] - bb_t[1]
+    espaco = int(altura * 0.025)
+    pad = int(largura * 0.025)
+
+    w_painel = max(w_n, w_t) + 2 * pad
+    h_painel = h_n + (espaco if texto_num else 0) + h_t + 2 * pad
+    x0 = (largura - w_painel) // 2
+    y0 = int(altura * 0.16)
+    draw.rounded_rectangle([x0, y0, x0 + w_painel, y0 + h_painel], radius=int(pad * 0.8),
+                           fill=(0, 0, 0, 175))
+    y = y0 + pad
+    if texto_num:
+        draw.text(((largura - w_n) / 2 - bb_n[0], y - bb_n[1]), texto_num, font=fonte_num,
+                  fill=(255, 255, 255, 255))
+        y += h_n + espaco
+    draw.text(((largura - w_t) / 2 - bb_t[0], y - bb_t[1]), nome, font=fonte_nome,
+              fill=(255, 255, 255, 255))
+
+    caminho_temp = os.path.join(ASSETS_DIR, f'_card_item_{abs(hash((numero, nome))) % 100000}.png')
+    img.save(caminho_temp)
+    fade = min(0.5, duracao / 4)
+    return ImageClip(caminho_temp).set_duration(duracao).crossfadein(fade).crossfadeout(fade)
 
 
 def pesquisar_foto_pexels(termo):
@@ -2548,7 +2869,9 @@ def gerar_thumbnail(titulo, termo, output_path, largura=1280, altura=720):
         return None
 
 
-def fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path=None):
+def fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path=None, publicar_em=None):
+    """publicar_em: datetime UTC (aware) → o vídeo sobe PRIVADO e o próprio YouTube o
+    torna público nessa hora (publishAt). None → público imediatamente (comportamento antigo)."""
     # BUGFIX (troca de esquema de credencial): antes um único secret YOUTUBE_CREDENTIALS
     # trazia o JSON inteiro (token, refresh_token, client_id, client_secret, scopes...)
     # gerado por Credentials.to_json(). Trocamos pra 3 secrets separados — mais simples
@@ -2579,6 +2902,9 @@ def fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path=Non
         'snippet': {'title': titulo, 'description': descricao, 'tags': tags, 'categoryId': '22'},
         'status': {'privacyStatus': 'public', 'selfDeclaredMadeForKids': False}
     }
+    if publicar_em is not None:
+        body['status']['privacyStatus'] = 'private'
+        body['status']['publishAt'] = publicar_em.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
     media = MediaFileUpload(video_path, resumable=True)
     request = youtube.videos().insert(part='snippet,status', body=body, media_body=media)
@@ -2599,6 +2925,17 @@ def main():
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     os.makedirs(ASSETS_DIR, exist_ok=True)
 
+    # 1ª pergunta da interação: estrutura do vídeo (webdoc em capítulos ou lista numerada).
+    # Sem Telegram/timeout vale 'formato_video_telegram.formato_padrao' (padrão: webdoc —
+    # o comportamento de sempre).
+    formato_video = {'formato': 'webdoc'}
+    if config.get('modo_roteiro') == 'capitulos_webdoc':
+        try:
+            formato_video = escolher_formato_telegram()
+        except Exception as e:
+            print(f"  ⚠️ Falha na escolha de formato via Telegram ({e}) — usando webdoc")
+    eh_lista = formato_video.get('formato') == 'lista'
+
     tema = None
     if ATIVA_TELEGRAM and config.get('selecao_tema_telegram', {}).get('ativo', False):
         try:
@@ -2618,8 +2955,12 @@ def main():
         tipo_video=VIDEO_TYPE,
         gemini_generate_fn=_gemini_generate,
         modo_roteiro=config.get('modo_roteiro', 'cadeia_completa'),
-        num_capitulos=config.get('num_capitulos_webdoc', 3),
+        num_capitulos=formato_video['num_itens'] if eh_lista else config.get('num_capitulos_webdoc', 3),
         palavras_alvo_webdoc=config.get('palavras_alvo_webdoc'),
+        formato='lista' if eh_lista else 'webdoc',
+        itens_lista=formato_video.get('itens'),
+        ordem_lista=formato_video.get('ordem', 'regressiva'),
+        notas_lista=formato_video.get('notas'),
     )
     roteiro = pacote_roteiro['roteiro_texto']
     titulo_video = pacote_roteiro['titulo']
@@ -2809,8 +3150,18 @@ def main():
         f"{descricao_pacote.get('abertura_seo', '')}\n\n{descricao_pacote.get('corpo', '')}"
         if descricao_pacote.get('corpo') else roteiro[:300] + '...'
     )
-    descricao = corpo_descricao + f'\n\n{texto_inscricao}\n#' + \
-                ('shorts' if VIDEO_TYPE == 'short' else hashtag_conteudo)
+    # Hashtags: config 'hashtags_descricao' (lista). Sem ela, usa o 'hashtag_conteudo' único de
+    # sempre. O YouTube mostra as 3 primeiras acima do título e ignora TODAS se passar de 15.
+    hashtags_cfg = config.get('hashtags_descricao') or [hashtag_conteudo]
+    if VIDEO_TYPE == 'short':
+        hashtags_cfg = ['shorts'] + list(hashtags_cfg)
+    hashtags, vistos = [], set()
+    for h in hashtags_cfg:
+        h = re.sub(r'[^\w]', '', str(h).lstrip('#'), flags=re.UNICODE)  # sem espaço/pontuação
+        if h and h.lower() not in vistos:
+            vistos.add(h.lower())
+            hashtags.append('#' + h)
+    descricao = corpo_descricao + f'\n\n{texto_inscricao}\n' + ' '.join(hashtags[:15])
     tags = config.get('tags_padrao', ['reflexao crista', 'motivacional', 'fe', 'inspiracao'])
     if VIDEO_TYPE == 'short':
         tags.append('shorts')
@@ -2830,17 +3181,45 @@ def main():
         texto_thumb = gerar_texto_thumbnail(titulo_video, tema)
         print(f"   Texto da thumb: {texto_thumb}")
         thumbnail_path = gerar_thumbnail(texto_thumb, termo, f'{ASSETS_DIR}/thumbnail.jpg')
-        thumbnail_path = revisar_thumbnail_telegram(thumbnail_path)
+        legenda_thumb = ""
+        if IDIOMA_REVISAO_PTBR and not IDIOMA_CONTEUDO_EH_PT:
+            try:
+                tr = _traduzir_para_ptbr([titulo_video, texto_thumb])
+                legenda_thumb = (f"Título: {titulo_video}\n🇧🇷 {tr[0]['pt']}\n\n"
+                                 f"Texto da thumb: {texto_thumb}\n🇧🇷 {tr[1]['pt']}")
+            except Exception as e:
+                print(f"  ⚠️ Tradução do título/thumb indisponível ({e})")
+                legenda_thumb = f"Título: {titulo_video}\nTexto da thumb: {texto_thumb}"
+        thumbnail_path = revisar_thumbnail_telegram(thumbnail_path, legenda_extra=legenda_thumb)
 
-        video_id = fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path)
+        publicar_em = None
+        try:
+            publicar_em = escolher_publicacao_telegram()  # None = agora (ou Telegram desligado)
+        except WorkflowCanceladoPeloUsuario:
+            raise
+        except Exception as e:
+            print(f"  ⚠️ Falha na escolha de publicação via Telegram ({e}) — publicando agora")
+
+        video_id = fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path,
+                                        publicar_em=publicar_em)
         url = f'https://youtube.com/{"shorts/" if VIDEO_TYPE == "short" else "watch?v="}{video_id}'
-        print(f"✅ Publicado!\n🔗 {url}")
+        if publicar_em:
+            print(f"✅ Enviado e AGENDADO pra {publicar_em.isoformat()} (UTC)!\n🔗 {url}")
+        else:
+            print(f"✅ Publicado!\n🔗 {url}")
+        if ATIVA_TELEGRAM:
+            try:
+                telegram_enviar_texto(("📅 Vídeo agendado" if publicar_em else "🚀 Vídeo publicado")
+                                      + f":\n{titulo}\n{url}")
+            except Exception:
+                pass
 
         log_entry = {
             'data': datetime.now().isoformat(), 'tipo': VIDEO_TYPE, 'tema': tema,
-            'titulo': titulo, 'duracao': duracao_narracao, 'video_id': video_id, 'url': url
+            'titulo': titulo, 'duracao': duracao_narracao, 'video_id': video_id, 'url': url,
+            'agendado_para_utc': publicar_em.isoformat() if publicar_em else None
         }
-        log_file = 'videos_gerados.json'
+        log_file = config.get('arquivo_videos_gerados', 'videos_gerados.json')
         logs = []
         if os.path.exists(log_file):
             with open(log_file, 'r', encoding='utf-8') as f:
@@ -2849,6 +3228,8 @@ def main():
         with open(log_file, 'w', encoding='utf-8') as f:
             json.dump(logs, f, indent=2, ensure_ascii=False)
 
+    except WorkflowCanceladoPeloUsuario:
+        raise  # decisão explícita (ex: sem resposta no agendamento com se_sem_resposta=cancelar)
     except Exception as e:
         print(f"❌ Erro no upload YouTube: {e}")
         import traceback

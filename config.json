@@ -91,10 +91,10 @@
     "timeout_resposta_min": 120
   },
   "destaques_telegram": {
-    "ativo": true,
+    "ativo": false,
     "timeout_resposta_min": 120
   },
-  "max_destaques_por_bloco": 1,
+  "max_destaques_por_bloco": 0,
   "volume_musica_fundo": 0.07,
   "idioma_conteudo": "português do Brasil",
   "idioma_whisper": "pt",

@@ -112,7 +112,7 @@
   "pexels_busca_telegram": {
     "ativo": true,
     "orientation": "landscape",
-    "min_duration": 10
+    "min_duration": 15
   },
   "formato_video_telegram": {
     "ativo": true,

@@ -68,7 +68,19 @@
     "emergency rescue workers brazil"
   ],
   "correcoes_pronuncia": {
-    "eua": "estados unidos"
+    "eua": "estados unidos",
+    "minuto": "minutu",
+    "minutos": "minutus",
+    "duzentos": "duzentus",
+    "cem": "sem",
+    "trezentos": "trezentus",
+    "quatrocentos": "quatrocentus",
+    "quinhentos": "kiéntus",
+    "seiscentos": "seiscentus",
+    "setecentos": "setecentus",
+    "oitocentos": "oitocentus",
+    "novecentos": "novecentus"
+    
   },
   "telegram_review": {
     "ativo": true,

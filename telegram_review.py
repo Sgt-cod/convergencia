@@ -149,8 +149,18 @@ def _teclado(botoes):
     return json.dumps({'inline_keyboard': [[_b(t, d) for t, d in linha] for linha in linhas]})
 
 
+LIMITE_MENSAGEM_TELEGRAM = 4096   # limite REAL do sendMessage (em caracteres, depois do parse)
+
+
 def enviar_texto(texto, botoes=None):
-    """botoes: ver _teclado()."""
+    """botoes: ver _teclado(). Texto acima do limite do Telegram é dividido em várias
+    mensagens (botões só na última) em vez de falhar com '400 Bad Request'."""
+    if len(texto) > LIMITE_MENSAGEM_TELEGRAM - 100:
+        pedacos = _quebrar_texto(texto, limite=3800)
+        resposta = None
+        for i, pedaco in enumerate(pedacos):
+            resposta = enviar_texto(pedaco, botoes=botoes if i == len(pedacos) - 1 else None)
+        return resposta
     params = {'chat_id': TELEGRAM_CHAT_ID, 'text': texto}
     if botoes:
         params['reply_markup'] = _teclado(botoes)
@@ -1119,8 +1129,15 @@ def escolher_tema_telegram(timeout_min=None):
             msg = upd.get('message')
             if msg and str(msg.get('chat', {}).get('id')) == str(TELEGRAM_CHAT_ID) and msg.get('text'):
                 tema = msg['text'].strip()
-                enviar_texto(f"👍 Tema recebido: \"{tema}\". Gerando o roteiro...")
-                print(f"  🎯 Tema recebido via Telegram: \"{tema}\"")
+                # A confirmação NUNCA pode derrubar a escolha: antes, um tema perto do limite
+                # (4093 caracteres) + o texto da confirmação passava de 4096 → 400 → o tema
+                # do usuário era descartado e o Gemini escolhia outro.
+                resumo = tema if len(tema) <= 300 else tema[:300].rstrip() + "…"
+                try:
+                    enviar_texto(f"👍 Tema recebido ({len(tema)} caracteres): \"{resumo}\". Gerando o roteiro...")
+                except Exception as e:
+                    print(f"  ⚠️ Confirmação do tema não enviada ({e}) — seguindo com o tema recebido")
+                print(f"  🎯 Tema recebido via Telegram: \"{resumo}\"")
                 return tema
 
     print(f"  ⏱️ Sem resposta de tema em {timeout_min} min — escolhendo automaticamente")

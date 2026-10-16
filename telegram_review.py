@@ -806,7 +806,7 @@ def perguntar_audio_customizado_telegram(nome_segmento, timeout_min=None, texto_
     cfg_audio = _config().get('audio_customizado_telegram', {})
     obrigatorio = bool(cfg_audio.get('obrigatorio', False))
     if timeout_min is None:
-        timeout_min = _timeout_min('audio_customizado_telegram', 15)
+        timeout_min = _timeout_min('audio_customizado_telegram', 45)
 
     limpar_filas_pendentes()
 

@@ -23,9 +23,9 @@
     "sociedade"
   ],
   "documento_estilo": [
-    "O aluguel médio nessa cidade de 40 mil habitantes já passa de 2 mil reais.\n\nO salário médio registrado, segundo o IBGE, não chega a 1.800.\n\nA conta não fecha — e mesmo assim os prédios continuam sendo construídos, um atrás do outro.\n\nPra entender por que isso acontece, precisamos voltar oito anos, quando a prefeitura aprovou uma mudança silenciosa no plano diretor.\n\nNinguém prestou atenção na época. Hoje, é impossível não notar.",
-    "Existem, hoje, mais de vinte e sete normas técnicas regulando a segurança contra incêndio em edificações no Brasil.\n\nNos Estados Unidos, pra o mesmo tipo de construção, esse número cai pra duas.\n\nIsso não significa que um país é mais seguro que o outro — significa que os dois resolveram o mesmo problema de formas completamente diferentes.\n\nE entender essa diferença explica por que um prédio de doze andares custa o dobro pra sair do papel aqui do que lá.",
-    "Em 2019, o governo aprovou um repasse de 40 milhões de reais pra modernizar a coleta de lixo de um município de 90 mil habitantes.\n\nCinco anos depois, a cidade recicla menos do que reciclava antes do dinheiro chegar.\n\nMas e se o problema nunca tiver sido a falta de verba — e sim quem decide pra onde ela vai?\n\nPra responder isso, a gente precisa entender como um convênio federal vira, na prática, moeda de troca política antes mesmo da primeira máquina ser comprada.\n\nQuem perde quando um repasse desses simplesmente some do orçamento sem deixar rastro? E por que ninguém é responsabilizado por isso?"
+    "Aluguel numa cidade de 40 mil habitantes: mais de 2 mil reais por mês.\n\nO salário médio de quem tem carteira assinada ali? Menos de 1.800, segundo o IBGE.\n\nOu seja, só o aluguel já custa mais do que a pessoa ganha.\n\nE mesmo assim, os prédios novos não param de aparecer, um atrás do outro.\n\nPra entender como isso é possível, a gente precisa voltar oito anos no tempo, quando a prefeitura mudou uma regra da cidade sem fazer barulho.\n\nNa época, ninguém prestou atenção. Hoje, é impossível não ver.",
+    "No Brasil, existem hoje mais de vinte e sete regras diferentes só pra definir como um prédio precisa se proteger de incêndio.\n\nNos Estados Unidos, pro mesmo tipo de prédio, são duas.\n\nIsso não quer dizer que um país é mais seguro que o outro. Quer dizer que cada um resolveu o mesmo problema do seu jeito.\n\nE entender essa diferença ajuda a explicar por que um prédio de doze andares custa o dobro pra sair do papel aqui do que lá.",
+    "Em 2019, o governo mandou 40 milhões de reais pra uma cidade de 90 mil habitantes melhorar a coleta de lixo.\n\nCinco anos depois, essa cidade recicla menos do que reciclava antes do dinheiro chegar.\n\nE se o problema nunca foi a falta de dinheiro, e sim quem decide pra onde ele vai?\n\nPra responder isso, a gente precisa entender como uma verba do governo federal pode virar moeda de troca na política antes mesmo de a primeira máquina ser comprada.\n\nE quem paga a conta quando esse dinheiro some do orçamento sem deixar rastro? Por que ninguém é responsabilizado?"
   ],
   "temas_reflexao": [
     "por que o aluguel sobe mais rápido que o salário em cidades médias",
@@ -68,19 +68,7 @@
     "emergency rescue workers brazil"
   ],
   "correcoes_pronuncia": {
-    "eua": "estados unidos",
-    "minuto": "minutu",
-    "minutos": "minutus",
-    "duzentos": "duzentus",
-    "cem": "sem",
-    "trezentos": "trezentus",
-    "quatrocentos": "quatrocentus",
-    "quinhentos": "kiéntus",
-    "seiscentos": "seiscentus",
-    "setecentos": "setecentus",
-    "oitocentos": "oitocentus",
-    "novecentos": "novecentus"
-    
+    "eua": "estados unidos"
   },
   "telegram_review": {
     "ativo": true,
@@ -99,7 +87,7 @@
   "idioma_conteudo": "português do Brasil",
   "idioma_whisper": "pt",
   "contexto_nicho": "documentário investigativo de dados sobre o Brasil (economia, urbanismo, política pública, sociedade)",
-  "instrucao_extra_roteiro": "Tom direto, factual e cético — nunca sensacionalista. Quando mencionar um número ou dado (percentual, valor em reais, quantidade), trate-o como precisando de verificação em fonte oficial antes da publicação (IBGE, Portal da Transparência, Câmara dos Deputados — ver fonte_dados.py) em vez de apresentá-lo como definitivo só porque soa plausível. Evite linguagem de indignação genérica (\"é um absurdo\", \"inaceitável\") — deixe os dados falarem por si.",
+  "instrucao_extra_roteiro": "Tom direto, factual e cético — nunca sensacionalista. Quando mencionar um número ou dado (percentual, valor em reais, quantidade), trate-o como precisando de verificação em fonte oficial antes da publicação (IBGE, Portal da Transparência, Câmara dos Deputados — ver fonte_dados.py) em vez de apresentá-lo como definitivo só porque soa plausível. Evite linguagem de indignação genérica (\"é um absurdo\", \"inaceitável\") — deixe os dados falarem por si.\nLINGUAGEM: escreva como quem explica pra um amigo que não é do assunto — o brasileiro médio, sem formação técnica. Frases curtas e diretas, com palavras do dia a dia. Sempre que aparecer um termo técnico, jurídico ou burocrático (ex: plano diretor, convênio, repasse, licitação, emenda), explique em uma frase simples o que é, ou troque por uma expressão comum. Prefira exemplos concretos e comparações do cotidiano (quanto pesa no bolso, no salário, na conta de luz) a conceitos abstratos; ao citar um número grande, ajude a enxergá-lo (\"quase um terço\", \"dá pra pagar mil salários mínimos\"). Tom de conversa clara e informal, mas SEM gírias, SEM palavrões e SEM erros de português. Evite palavras rebuscadas (outrossim, destarte, no tocante a), frases longas com várias ideias e voz passiva.",
   "texto_inscricao": "🔔 Inscreva-se para mais investigações como essa!",
   "hashtag_conteudo": "brasil",
   "idioma_gtts": "pt-br",

@@ -137,7 +137,7 @@ DURACAO_MINIMA_CLIPE = float(os.environ.get('DURACAO_MINIMA_CLIPE', '7'))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
-ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', 'true').lower() == 'true'  # Fase 2: texto de destaque
+ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', str(config.get('ativar_destaque', True))).lower() == 'true'  # Fase 2: texto de destaque
 ATIVAR_SFX = os.environ.get('ATIVAR_SFX', 'true').lower() == 'true'  # Fase 2: SFX de transição/destaque
 MAX_PAGINAS_BLOCO = int(os.environ.get('MAX_PAGINAS_BLOCO', '3'))  # páginas Pexels por bloco (não por vídeo)
 # LEGENDA_FONTE é definida logo após o carregamento do config.json (precisa do config.get(...))
@@ -229,6 +229,8 @@ roteiro_engine.configurar(
     chars_min=config.get('caracteres_alvo_min'),
     chars_max=config.get('caracteres_alvo_max'),
     chars_por_palavra=config.get('caracteres_por_palavra'),
+    abertura_intro=(config.get('abertura_introducao', {}).get('texto', '')
+                    if config.get('abertura_introducao', {}).get('ativo', False) else ''),
 )
 configurar_pais(**{k: v for k, v in config.get('contexto_pais', {}).items()})
 
@@ -2009,7 +2011,7 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     # duas vezes); a pergunta de áudio precisa vir antes da chamada à Fish Audio
     # pra não gastar TTS à toa quando você já sabe que vai mandar o seu.
     destaques_manuais_pre = None
-    if ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
+    if ATIVAR_DESTAQUE and ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
         try:
             destaques_manuais_pre = escolher_destaques_telegram(texto_segmento, nome_segmento)
         except Exception as e:
@@ -2082,7 +2084,9 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
 
         destaques_manuais = destaques_manuais_pre
 
-        if destaques_manuais is not None:
+        if not ATIVAR_DESTAQUE:
+            destaques_por_bloco = [[] for _ in blocos_com_tempo_local]   # destaques desligados no config
+        elif destaques_manuais is not None:
             destaques_por_bloco = mapear_destaques_manuais_para_blocos(blocos_com_tempo_local, destaques_manuais)
         else:
             destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo_local, _gemini_generate,

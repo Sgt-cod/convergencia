@@ -806,7 +806,7 @@ def perguntar_audio_customizado_telegram(nome_segmento, timeout_min=None, texto_
     cfg_audio = _config().get('audio_customizado_telegram', {})
     obrigatorio = bool(cfg_audio.get('obrigatorio', False))
     if timeout_min is None:
-        timeout_min = _timeout_min('audio_customizado_telegram', 45)
+        timeout_min = _timeout_min('audio_customizado_telegram', 15)
 
     limpar_filas_pendentes()
 
@@ -1092,6 +1092,39 @@ def escolher_formato_telegram(timeout_min=None):
                if itens else "itens escolhidos pelo pipeline."))
     enviar_texto(resumo)
     return {'formato': 'lista', 'num_itens': num_itens, 'ordem': ordem, 'itens': itens, 'notas': notas}
+
+
+def perguntar_base_fechada_telegram(texto, timeout_min=None):
+    """
+    Chamada quando o 'tema' enviado é longo (um briefing com instruções + dados). Pergunta se
+    o texto deve valer como BASE FECHADA — o roteiro usa SÓ os fatos que estão nele, e uma
+    etapa extra confere o roteiro contra a base — ou apenas como tema/direcionamento (o
+    Gemini pode complementar com conhecimento próprio, como sempre).
+    Devolve True (base fechada) ou False. Sem resposta no tempo: usa 'base_fechada_telegram'
+    → 'padrao' do config ('base' por padrão: é o lado seguro contra dado inventado).
+    """
+    cfg = _config().get('base_fechada_telegram', {})
+    padrao_base = cfg.get('padrao', 'base') == 'base'
+    if not ATIVA_TELEGRAM:
+        return padrao_base
+    if timeout_min is None:
+        timeout_min = _timeout_min('base_fechada_telegram', 10)
+    limpar_filas_pendentes()
+    enviar_texto(
+        f"🔒 Recebi {len(texto)} caracteres. Usar como BASE FECHADA?\n\n"
+        "• 🔒 Base fechada: o roteiro usa SÓ os dados que você mandou, e uma etapa extra confere "
+        "o texto contra eles (frases sem sustento são removidas ou suavizadas).\n"
+        "• 📝 Só como tema: o Gemini usa o texto como direção e pode complementar com o que ele sabe "
+        "(risco de dado errado).",
+        botoes=[('🔒 Base fechada', 'base'), ('📝 Só como tema', 'tema')])
+    while True:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+        if tipo is None:
+            enviar_texto("⏱️ Sem resposta — usando " + ("BASE FECHADA." if padrao_base else "só como tema."))
+            return padrao_base
+        if tipo == 'callback' and valor in ('base', 'tema'):
+            enviar_texto("🔒 Base fechada ativada." if valor == 'base' else "📝 Usando só como tema.")
+            return valor == 'base'
 
 
 def escolher_tema_telegram(timeout_min=None):

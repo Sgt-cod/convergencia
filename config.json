@@ -90,6 +90,7 @@
   "instrucao_extra_roteiro": "Tom direto, factual e cético — nunca sensacionalista. Quando mencionar um número ou dado (percentual, valor em reais, quantidade), trate-o como precisando de verificação em fonte oficial antes da publicação (IBGE, Portal da Transparência, Câmara dos Deputados — ver fonte_dados.py) em vez de apresentá-lo como definitivo só porque soa plausível. Evite linguagem de indignação genérica (\"é um absurdo\", \"inaceitável\") — deixe os dados falarem por si.\nLINGUAGEM: escreva como quem explica pra um amigo que não é do assunto — o brasileiro médio, sem formação técnica. Frases curtas e diretas, com palavras do dia a dia. Sempre que aparecer um termo técnico, jurídico ou burocrático (ex: plano diretor, convênio, repasse, licitação, emenda), explique em uma frase simples o que é, ou troque por uma expressão comum. Prefira exemplos concretos e comparações do cotidiano (quanto pesa no bolso, no salário, na conta de luz) a conceitos abstratos; ao citar um número grande, ajude a enxergá-lo (\"quase um terço\", \"dá pra pagar mil salários mínimos\"). Tom de conversa clara e informal, mas SEM gírias, SEM palavrões e SEM erros de português. Evite palavras rebuscadas (outrossim, destarte, no tocante a), frases longas com várias ideias e voz passiva.",
   "texto_inscricao": "🔔 Inscreva-se para mais investigações como essa!",
   "hashtag_conteudo": "brasil",
+  "hashtags_descricao": ["brasil", "documentario", "economia", "curiosidades", "elementar", "elementaracademy", "convergência"],
   "idioma_gtts": "pt-br",
   "agendamento_telegram": {
     "ativo": true,
@@ -100,7 +101,7 @@
   "pexels_busca_telegram": {
     "ativo": true,
     "orientation": "landscape",
-    "min_duration": 10
+    "min_duration": 15
   },
   "formato_video_telegram": {
     "ativo": true,
@@ -117,13 +118,13 @@
   "ativar_destaque": false,
   "abertura_introducao": {
     "ativo": false,
-    "texto": "Seja bem-vindo ao Convergência, eu sou o Fulano."
+    "texto": "Seja bem-vindo ao Convergência, eu sou o Dimitri. E hoje eu acompanho vocês na busca pela verdade."
   },
   "base_fechada_telegram": {
     "ativo": true,
     "limiar_caracteres": 400,
     "padrao": "base",
-    "timeout_resposta_min": 10
+    "timeout_resposta_min": 15
   },
   "apresentacao_narrador": {
     "ativo": true,

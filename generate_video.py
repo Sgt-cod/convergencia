@@ -2332,6 +2332,21 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
     else:
         print("  ℹ️ Nenhum CTA encontrado em assets/cta/ — seguindo sem CTA final")
 
+    # Apresentação do narrador (config 'apresentacao_narrador'): vídeo PRONTO (~10 s, com o próprio
+    # áudio) que abre o vídeo, ANTES do primeiro segmento da introdução. Mesma lógica da vinheta
+    # e do CTA: pega o .mp4/.mov da pasta e ajusta ao tamanho do vídeo. Conta na duração total
+    # e nos capítulos da descrição (a "Introdução" continua marcada em 00:00).
+    apresentacao_clip = None
+    cfg_apres = config.get('apresentacao_narrador', {})
+    if cfg_apres.get('ativo', False):
+        apresentacao_clip, apres_path = _carregar_clip_de_pasta(
+            cfg_apres.get('pasta', f'{ASSETS_DIR}/apresentacao'), largura, altura, manter_audio=True)
+        if apresentacao_clip:
+            print(f"  🎙️ Apresentação do narrador: {os.path.basename(apres_path)} ({apresentacao_clip.duration:.1f}s)")
+        else:
+            print(f"  ⚠️ 'apresentacao_narrador' ativo, mas nenhum .mp4/.mov em "
+                  f"{cfg_apres.get('pasta', f'{ASSETS_DIR}/apresentacao')} — seguindo sem apresentação")
+
     duracao_card = float(config.get('duracao_card_capitulo', 7.0))
 
     global CAPITULOS_VIDEO
@@ -2344,6 +2359,9 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
     marco_atual = 0.0  # onde o próximo segmento "começa" pro espectador (no webdoc: no card dele)
 
     clips_finais = []
+    if apresentacao_clip:
+        clips_finais.append(apresentacao_clip)
+        cursor += apresentacao_clip.duration   # entra na conta dos capítulos; a Introdução segue em 00:00
     for i, grupo in enumerate(segmentos):
         fade_in = (i > 0)  # a introdução (i=0) é o próprio início do vídeo — sem fade-in
         clip_segmento = renderizar_segmento_webdoc(grupo, tema, largura, altura, orientacao,

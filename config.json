@@ -100,7 +100,7 @@
   "pexels_busca_telegram": {
     "ativo": true,
     "orientation": "landscape",
-    "min_duration": 15
+    "min_duration": 10
   },
   "formato_video_telegram": {
     "ativo": true,
@@ -116,13 +116,17 @@
   },
   "ativar_destaque": false,
   "abertura_introducao": {
-    "ativo": true,
-    "texto": "Seja bem-vindo ao Convergência, eu sou o Dimitri. E hoje eu acompanho vocês na busca pela verdade."
+    "ativo": false,
+    "texto": "Seja bem-vindo ao Convergência, eu sou o Fulano."
   },
   "base_fechada_telegram": {
     "ativo": true,
     "limiar_caracteres": 400,
     "padrao": "base",
-    "timeout_resposta_min": 15
+    "timeout_resposta_min": 10
+  },
+  "apresentacao_narrador": {
+    "ativo": true,
+    "pasta": "assets/apresentacao"
   }
 }

@@ -2992,5 +2992,15 @@
     "video_id": "_cbkQUoduEo",
     "url": "https://youtube.com/watch?v=_cbkQUoduEo",
     "agendado_para_utc": null
+  },
+  {
+    "data": "2026-11-03T13:14:26.410091",
+    "tipo": "long",
+    "tema": "O avanço de alimentos impressos em 3D e cultivados em laboratório no Brasil e os desafios de sua aceitação pelos consumidores.",
+    "titulo": "Salmão e Caviar de Laboratório: O Que a Embrapa Está Esco...",
+    "duracao": 377.71,
+    "video_id": "I8WXg2v8_gM",
+    "url": "https://youtube.com/watch?v=I8WXg2v8_gM",
+    "agendado_para_utc": "2026-11-03T15:00:00+00:00"
   }
 ]

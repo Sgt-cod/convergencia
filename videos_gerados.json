@@ -3012,5 +3012,15 @@
     "video_id": "04FGgT3QgD4",
     "url": "https://youtube.com/watch?v=04FGgT3QgD4",
     "agendado_para_utc": "2026-11-10T17:30:00+00:00"
+  },
+  {
+    "data": "2026-11-14T15:16:41.271692",
+    "tipo": "long",
+    "tema": "Os impactos da regulação e insegurança jurídica na permanência da Uber no Brasil",
+    "titulo": "Uber no Brasil: O que aconteceu depois do fim do Uber Eats?",
+    "duracao": 299.75,
+    "video_id": "FAAEF52OYPU",
+    "url": "https://youtube.com/watch?v=FAAEF52OYPU",
+    "agendado_para_utc": null
   }
 ]

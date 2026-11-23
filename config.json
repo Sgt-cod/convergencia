@@ -16,6 +16,7 @@
     "shadow_wipe"
   ],
   "usar_prints_noticia": true,
+  "declarar_conteudo_sintetico": true,
   "usar_legenda": true,
   "tags_padrao": [
     "brasil",
@@ -130,7 +131,7 @@
     "timeout_resposta_min": 15
   },
   "apresentacao_narrador": {
-    "ativo": true,
+    "ativo": false,
     "pasta": "assets/apresentacao"
   }
 }

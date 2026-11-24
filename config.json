@@ -17,6 +17,7 @@
   ],
   "usar_prints_noticia": true,
   "declarar_conteudo_sintetico": true,
+  "abortar_se_roteiro_emergencia": true,
   "usar_legenda": true,
   "tags_padrao": [
     "brasil",
